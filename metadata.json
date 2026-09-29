@@ -1,0 +1,6 @@
+{
+  "name": "DIPTA — Dashboard Integrasi Pelayanan Terpadu",
+  "description": "Dashboard Integrasi Pelayanan Terpadu DPMPTSP Kabupaten Ogan Komering Ilir. Konsolidasi dan monitoring data pelayanan OSS-RBA, SICANTIK Cloud, dan SIMBG.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
