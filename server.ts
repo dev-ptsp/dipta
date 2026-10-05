@@ -1,6 +1,7 @@
 import express from 'express';
 import { createServer as createViteServer } from 'vite';
 import path from 'path';
+import fs from 'fs';
 import { fileURLToPath } from 'url';
 import dotenv from 'dotenv';
 import { GoogleGenAI } from '@google/genai';
@@ -20,15 +21,24 @@ async function startServer() {
 
   app.use(express.json({ limit: '10mb' }));
 
-  // Initialize Gemini client as required by guidelines
-  const ai = new GoogleGenAI({
-    apiKey: process.env.GEMINI_API_KEY,
-    httpOptions: {
-      headers: {
-        'User-Agent': 'aistudio-build',
-      },
-    },
-  });
+  // Helper to get Gemini client safely without crashing startup if GEMINI_API_KEY is unset
+  const getAiClient = () => {
+    const apiKey = process.env.GEMINI_API_KEY;
+    if (!apiKey) return null;
+    try {
+      return new GoogleGenAI({
+        apiKey,
+        httpOptions: {
+          headers: {
+            'User-Agent': 'aistudio-build',
+          },
+        },
+      });
+    } catch (err) {
+      console.warn('[DIPTA Server] Failed to initialize GoogleGenAI:', err);
+      return null;
+    }
+  };
 
   // Health check endpoint
   app.get('/api/health', (req, res) => {
@@ -42,12 +52,6 @@ async function startServer() {
   // AI Insight API endpoint
   app.post('/api/ai/insight', async (req, res) => {
     try {
-      if (!process.env.GEMINI_API_KEY) {
-        return res.status(500).json({
-          error: 'GEMINI_API_KEY belum dikonfigurasi pada server.',
-        });
-      }
-
       const {
         filterSummary = {},
         metrics = {},
@@ -139,7 +143,8 @@ Susun laporan analisis dalam format Markdown yang rapi, elegan, berwibawa, dan m
       let usedModel = 'gemini-2.5-flash';
       let lastError: any = null;
 
-      if (process.env.GEMINI_API_KEY) {
+      const ai = getAiClient();
+      if (ai) {
         for (const modelName of modelsToTry) {
           try {
             const response = await ai.models.generateContent({
@@ -227,6 +232,138 @@ Kinerja pelayanan secara umum menunjukkan komitmen aparatur yang solid dalam mem
       console.error('Gemini AI Insight generation error:', error);
       return res.status(500).json({
         error: error.message || 'Terjadi kesalahan saat memproses AI Insight.',
+      });
+    }
+  });
+
+  // Supabase Auto-Migrate & Seed via Management API
+  app.post('/api/supabase/auto-migrate', async (req, res) => {
+    try {
+      const { projectRef = 'lajhgapanricrzlxlniq', accessToken, sql } = req.body;
+      const token = (accessToken || process.env.SUPABASE_ACCESS_TOKEN || '').trim();
+
+      if (!token) {
+        return res.status(400).json({
+          success: false,
+          error: 'Masukkan Personal Access Token Supabase (sbp_...) atau jalankan skrip SQL di SQL Editor Supabase.',
+        });
+      }
+
+      if (!sql) {
+        return res.status(400).json({
+          success: false,
+          error: 'Skrip SQL tidak ditemukan.',
+        });
+      }
+
+      const response = await fetch(
+        `https://api.supabase.com/v1/projects/${encodeURIComponent(projectRef)}/database/query`,
+        {
+          method: 'POST',
+          headers: {
+            Authorization: `Bearer ${token}`,
+            'Content-Type': 'application/json',
+          },
+          body: JSON.stringify({ query: sql }),
+        }
+      );
+
+      const text = await response.text();
+      if (!response.ok) {
+        return res.status(response.status).json({
+          success: false,
+          error: `Supabase Management API (${response.status}): ${text}`,
+        });
+      }
+
+      return res.json({
+        success: true,
+        message: 'Skema 6 tabel dan seluruh data awal berhasil dieksekusi langsung di Supabase Cloud!',
+      });
+    } catch (err: any) {
+      return res.status(500).json({
+        success: false,
+        error: err?.message || 'Gagal mengeksekusi migrasi otomatis ke Supabase.',
+      });
+    }
+  });
+
+  // Helper to recursively collect project files for Vercel REST API deployment
+  const collectProjectFiles = (dir: string, baseDir: string = dir): Array<{ file: string; data: string }> => {
+    const results: Array<{ file: string; data: string }> = [];
+    const ignoreDirs = new Set(['node_modules', '.git', 'dist', '.gmp_cache', '.vercel']);
+    const ignoreFiles = new Set(['bun.lock', 'package-lock.json', '.env', '.dev.env.json']);
+
+    const entries = fs.readdirSync(dir, { withFileTypes: true });
+    for (const entry of entries) {
+      if (ignoreDirs.has(entry.name) || ignoreFiles.has(entry.name)) continue;
+      const fullPath = path.join(dir, entry.name);
+      const relPath = path.relative(baseDir, fullPath).replace(/\\/g, '/');
+
+      if (entry.isDirectory()) {
+        results.push(...collectProjectFiles(fullPath, baseDir));
+      } else if (entry.isFile()) {
+        const content = fs.readFileSync(fullPath, 'utf8');
+        results.push({ file: relPath, data: content });
+      }
+    }
+    return results;
+  };
+
+  // Vercel Direct Deployment Endpoint via Vercel REST API v13
+  app.post('/api/vercel/deploy', async (req, res) => {
+    try {
+      const { vercelToken, projectName = 'dipta-dpmptsp-oki' } = req.body;
+      const token = (vercelToken || process.env.VERCEL_TOKEN || '').trim();
+
+      if (!token) {
+        return res.status(400).json({
+          success: false,
+          error: 'Masukkan Vercel Access Token (dari vercel.com/account/tokens) untuk melakukan deploy baru.',
+        });
+      }
+
+      const files = collectProjectFiles(__dirname);
+
+      const response = await fetch('https://api.vercel.com/v13/deployments?skipAutoDetectionConfirmation=1', {
+        method: 'POST',
+        headers: {
+          Authorization: `Bearer ${token}`,
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify({
+          name: projectName.toLowerCase().replace(/[^a-z0-9-]/g, '-'),
+          files,
+          projectSettings: {
+            framework: 'vite',
+            buildCommand: 'vite build',
+            outputDirectory: 'dist',
+            installCommand: 'npm install',
+          },
+          target: 'production',
+        }),
+      });
+
+      const data: any = await response.json();
+      if (!response.ok) {
+        return res.status(response.status).json({
+          success: false,
+          error: data?.error?.message || JSON.stringify(data),
+        });
+      }
+
+      const deployedUrl = data.url ? `https://${data.url}` : 'https://temporary-flying-chestnut-avbarf8.vercel.app';
+      return res.json({
+        success: true,
+        url: deployedUrl,
+        readyState: data.readyState || 'QUEUED',
+        deploymentId: data.id,
+        projectName: data.name,
+      });
+    } catch (err: any) {
+      return res.status(500).json({
+        success: false,
+        error: err?.message || 'Gagal melakukan deployment ke Vercel.',
       });
     }
   });

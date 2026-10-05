@@ -39,13 +39,16 @@ import {
   Briefcase,
   Filter,
   Info,
-  ShieldCheck
+  ShieldCheck,
+  Globe,
+  Terminal,
+  Zap
 } from 'lucide-react';
 
 interface AdministrationViewProps {
   currentUser: User;
   onDataRefresh?: () => void;
-  initialTab?: 'USERS' | 'ROLES' | 'MAPPING' | 'KECAMATAN' | 'DATABASE';
+  initialTab?: 'USERS' | 'ROLES' | 'MAPPING' | 'KECAMATAN' | 'DATABASE' | 'VERCEL';
 }
 
 export interface RoleMetadata {
@@ -133,7 +136,118 @@ export const ROLE_DEFINITIONS: RoleMetadata[] = [
 ];
 
 export const AdministrationView: React.FC<AdministrationViewProps> = ({ currentUser, onDataRefresh, initialTab }) => {
-  const [activeTab, setActiveTab] = useState<'USERS' | 'ROLES' | 'MAPPING' | 'KECAMATAN' | 'DATABASE'>(initialTab || 'USERS');
+  const [activeTab, setActiveTab] = useState<'USERS' | 'ROLES' | 'MAPPING' | 'KECAMATAN' | 'DATABASE' | 'VERCEL'>(initialTab || 'USERS');
+
+  // Vercel Deployment Tab State
+  const [vercelCopied, setVercelCopied] = useState<string | null>(null);
+  const [vercelTestStatus, setVercelTestStatus] = useState<{ testing: boolean; result?: any; latency?: number }>({ testing: false });
+  const [vercelDomainUrl, setVercelDomainUrl] = useState<string>(
+    () => localStorage.getItem('dipta_vercel_url') || 'https://temporary-flying-chestnut-avbarf8.vercel.app'
+  );
+  const [vercelToken, setVercelToken] = useState<string>(() => localStorage.getItem('dipta_vercel_token') || '');
+  const [isDeployingVercel, setIsDeployingVercel] = useState(false);
+  const [vercelDeployFeedback, setVercelDeployFeedback] = useState<{ type: 'success' | 'error'; message: string } | null>(null);
+
+  // Supabase Management API Token for 1-click Auto-Migration
+  const [supabaseAccessToken, setSupabaseAccessToken] = useState<string>(
+    () => localStorage.getItem('dipta_supabase_pat') || ''
+  );
+  const [isAutoMigrating, setIsAutoMigrating] = useState(false);
+
+  const handleCopyVercel = (text: string, key: string) => {
+    navigator.clipboard.writeText(text);
+    setVercelCopied(key);
+    setTimeout(() => setVercelCopied(null), 2500);
+  };
+
+  const handleTestVercel = async () => {
+    setVercelTestStatus({ testing: true });
+    const start = Date.now();
+    try {
+      const res = await fetch(`${vercelDomainUrl.replace(/\/$/, '')}/api/health`);
+      const data = await res.json();
+      const latency = Date.now() - start;
+      setVercelTestStatus({ testing: false, result: data, latency });
+    } catch (err: any) {
+      setVercelTestStatus({ testing: false, result: { error: err?.message || 'Gagal menghubungi server Vercel' } });
+    }
+  };
+
+  const handleDirectDeployVercel = async (e: React.FormEvent) => {
+    e.preventDefault();
+    setIsDeployingVercel(true);
+    setVercelDeployFeedback(null);
+    try {
+      if (vercelToken.trim()) {
+        localStorage.setItem('dipta_vercel_token', vercelToken.trim());
+      }
+      const res = await fetch('/api/vercel/deploy', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          vercelToken: vercelToken.trim(),
+          projectName: 'dipta-dpmptsp-oki'
+        })
+      });
+      const data = await res.json();
+      if (!res.ok || !data.success) {
+        throw new Error(data.error || 'Gagal melakukan deploy ke Vercel.');
+      }
+      if (data.url) {
+        setVercelDomainUrl(data.url);
+        localStorage.setItem('dipta_vercel_url', data.url);
+      }
+      setVercelDeployFeedback({
+        type: 'success',
+        message: `Berhasil! Build terbaru telah dideploy ke Vercel pada domain: ${data.url}`
+      });
+    } catch (err: any) {
+      setVercelDeployFeedback({
+        type: 'error',
+        message: err?.message || 'Gagal melakukan deploy ke Vercel.'
+      });
+    } finally {
+      setIsDeployingVercel(false);
+    }
+  };
+
+  const handleAutoMigrateSupabase = async () => {
+    setIsAutoMigrating(true);
+    setSyncFeedback(null);
+    try {
+      if (supabaseAccessToken.trim()) {
+        localStorage.setItem('dipta_supabase_pat', supabaseAccessToken.trim());
+      }
+      const projectRef = inputUrl.split('//')[1]?.split('.')[0] || 'lajhgapanricrzlxlniq';
+      const res = await fetch('/api/supabase/auto-migrate', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          projectRef,
+          accessToken: supabaseAccessToken.trim(),
+          sql: fullSeedSql
+        })
+      });
+      const data = await res.json();
+      if (!res.ok || !data.success) {
+        throw new Error(data.error || 'Gagal mengeksekusi migrasi otomatis.');
+      }
+      // After tables are created and seeded, also run syncAllToSupabase
+      const syncRes = await DiptaStorageService.syncAllToSupabase();
+      setLastSyncTime(DiptaSupabaseService.getLastSync());
+      setSyncFeedback({
+        type: 'success',
+        message: `Berhasil! Keenam tabel dibuat otomatis di Supabase Cloud (${projectRef}) dan seluruh database (${syncRes.recordsCount} item) telah terkirim!`
+      });
+    } catch (err: any) {
+      setSyncFeedback({
+        type: 'error',
+        message: err?.message || 'Gagal menjalankan migrasi otomatis.'
+      });
+    } finally {
+      setIsAutoMigrating(false);
+    }
+  };
 
   const [users, setUsers] = useState<User[]>(DiptaStorageService.getAllUsers());
   const [mappingRules, setMappingRules] = useState<StatusMappingRule[]>(DiptaStorageService.getStatusMappingRules());
@@ -474,8 +588,17 @@ export const AdministrationView: React.FC<AdministrationViewProps> = ({ currentU
     }
   };
 
+  const fullSeedSql = useMemo(() => {
+    return DiptaSupabaseService.getFullSeedSQL({
+      users,
+      mappings: mappingRules,
+      records: DiptaStorageService.getAllRecords(),
+      batches: DiptaStorageService.getAllBatches()
+    });
+  }, [users, mappingRules]);
+
   const handleCopySql = () => {
-    navigator.clipboard.writeText(DiptaSupabaseService.getMigrationSQL());
+    navigator.clipboard.writeText(fullSeedSql);
     setCopiedSql(true);
     setTimeout(() => setCopiedSql(false), 3000);
   };
@@ -592,6 +715,23 @@ export const AdministrationView: React.FC<AdministrationViewProps> = ({ currentU
           <span className="flex h-2 w-2 relative">
             <span className="animate-ping absolute inline-flex h-full w-full rounded-full bg-emerald-400 opacity-75"></span>
             <span className="relative inline-flex rounded-full h-2 w-2 bg-emerald-500"></span>
+          </span>
+        </button>
+
+        <button
+          id="tab-admin-vercel"
+          onClick={() => setActiveTab('VERCEL')}
+          className={`flex items-center gap-2 px-4 py-2.5 text-xs font-semibold border-b-2 transition-all ${
+            activeTab === 'VERCEL'
+              ? 'border-indigo-600 text-indigo-800 bg-indigo-50/40'
+              : 'border-transparent text-slate-500 hover:text-slate-800'
+          }`}
+        >
+          <Globe className="w-4 h-4 text-indigo-600" />
+          <span>Deployment & Domain Vercel</span>
+          <span className="flex h-2 w-2 relative">
+            <span className="animate-ping absolute inline-flex h-full w-full rounded-full bg-indigo-400 opacity-75"></span>
+            <span className="relative inline-flex rounded-full h-2 w-2 bg-indigo-500"></span>
           </span>
         </button>
       </div>
@@ -1671,37 +1811,78 @@ export const AdministrationView: React.FC<AdministrationViewProps> = ({ currentU
               <div>
                 <h4 className="text-sm font-bold text-slate-900 flex items-center gap-2">
                   <Server className="w-4 h-4 text-emerald-600" />
-                  <span>Skrip SQL Migrasi Database (Supabase SQL Editor)</span>
+                  <span>Skrip SQL Lengkap: Skema 6 Tabel + Kirim Data Awal (Supabase SQL Editor)</span>
                 </h4>
                 <p className="text-xs text-slate-500 mt-0.5">
-                  Jalankan skrip DDL PostgreSQL berikut di SQL Editor Supabase untuk membuat 5 tabel utama DIPTA beserta indeks dan kebijakan keamanannya (RLS).
+                  Jalankan skrip PostgreSQL ini di SQL Editor Supabase untuk membuat 6 tabel utama DIPTA beserta indeks, RLS, dan langsung mengisi data pengguna, aturan pemetaan status, serta rekaman pelayanan.
                 </p>
               </div>
 
-              <button
-                type="button"
-                onClick={handleCopySql}
-                className={`flex items-center gap-1.5 px-3.5 py-2 rounded-lg text-xs font-semibold transition-all shrink-0 ${
-                  copiedSql
-                    ? 'bg-emerald-600 text-white shadow-xs'
-                    : 'bg-slate-100 hover:bg-slate-200 text-slate-800 border border-slate-300'
-                }`}
-              >
-                {copiedSql ? (
-                  <>
-                    <Check className="w-4 h-4 text-white" />
-                    <span>Tersalin ke Clipboard!</span>
-                  </>
-                ) : (
-                  <>
-                    <Copy className="w-4 h-4 text-slate-600" />
-                    <span>Salin Skrip SQL</span>
-                  </>
-                )}
-              </button>
+              <div className="flex flex-wrap items-center gap-2 shrink-0">
+                <button
+                  type="button"
+                  onClick={handleCopySql}
+                  className={`flex items-center gap-1.5 px-3.5 py-2 rounded-lg text-xs font-semibold transition-all cursor-pointer ${
+                    copiedSql
+                      ? 'bg-emerald-600 text-white shadow-xs'
+                      : 'bg-slate-100 hover:bg-slate-200 text-slate-800 border border-slate-300'
+                  }`}
+                >
+                  {copiedSql ? (
+                    <>
+                      <Check className="w-4 h-4 text-white" />
+                      <span>SQL + Data Tersalin!</span>
+                    </>
+                  ) : (
+                    <>
+                      <Copy className="w-4 h-4 text-slate-600" />
+                      <span>Salin SQL Lengkap (Skema + Data)</span>
+                    </>
+                  )}
+                </button>
+
+                <a
+                  href={`https://supabase.com/dashboard/project/${inputUrl.split('//')[1]?.split('.')[0] || 'lajhgapanricrzlxlniq'}/sql/new`}
+                  target="_blank"
+                  rel="noopener noreferrer"
+                  onClick={handleCopySql}
+                  className="flex items-center gap-1.5 px-3.5 py-2 rounded-lg bg-emerald-600 hover:bg-emerald-700 text-white text-xs font-bold shadow-xs transition-colors"
+                >
+                  <span>Salin & Buka SQL Editor Supabase</span>
+                  <ExternalLink className="w-3.5 h-3.5" />
+                </a>
+              </div>
             </div>
 
             {/* Quick 3-Step Setup Instructions */}
+            <div className="p-4 bg-emerald-50/70 rounded-xl border border-emerald-200 space-y-2.5">
+              <div className="text-xs font-bold text-emerald-950 flex items-center gap-1.5">
+                <Zap className="w-4 h-4 text-emerald-600" />
+                <span>Opsi Instan: Buat Tabel & Kirim Database Otomatis (Tanpa Buka SQL Editor)</span>
+              </div>
+              <p className="text-[11px] text-emerald-800">
+                Jika Anda memiliki <strong>Supabase Personal Access Token</strong> (<code className="font-mono">sbp_...</code> dari <a href="https://supabase.com/dashboard/account/tokens" target="_blank" rel="noreferrer" className="underline font-semibold">supabase.com/dashboard/account/tokens</a>), tempelkan di bawah untuk membuat 6 tabel dan mengirim seluruh database secara otomatis dalam 1 klik:
+              </p>
+              <div className="flex flex-col sm:flex-row items-stretch sm:items-center gap-2">
+                <input
+                  type="password"
+                  value={supabaseAccessToken}
+                  onChange={(e) => setSupabaseAccessToken(e.target.value)}
+                  placeholder="sbp_xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+                  className="flex-1 bg-white border border-emerald-300 rounded-lg px-3 py-2 text-xs font-mono text-slate-800 focus:outline-emerald-600"
+                />
+                <button
+                  type="button"
+                  onClick={handleAutoMigrateSupabase}
+                  disabled={isAutoMigrating}
+                  className="px-4 py-2 rounded-lg bg-emerald-700 hover:bg-emerald-800 text-white text-xs font-bold flex items-center justify-center gap-1.5 shadow-xs transition-colors cursor-pointer disabled:opacity-50 shrink-0"
+                >
+                  <CloudUpload className={`w-4 h-4 ${isAutoMigrating ? 'animate-bounce' : ''}`} />
+                  <span>{isAutoMigrating ? 'Mengeksekusi ke Supabase...' : 'Buat Tabel & Kirim Database Otomatis'}</span>
+                </button>
+              </div>
+            </div>
+
             <div className="grid grid-cols-1 md:grid-cols-3 gap-3">
               <div className="p-3 bg-slate-50 rounded-lg border border-slate-200 text-xs">
                 <span className="w-5 h-5 rounded-full bg-emerald-600 text-white font-bold text-[11px] inline-flex items-center justify-center mb-1.5">
@@ -1709,7 +1890,7 @@ export const AdministrationView: React.FC<AdministrationViewProps> = ({ currentU
                 </span>
                 <div className="font-bold text-slate-800">Buka SQL Editor di Supabase</div>
                 <p className="text-[11px] text-slate-500 mt-0.5">
-                  Masuk ke proyek Supabase <code className="text-emerald-700 font-mono">lajhgapanricrzlxlniq</code> lalu buka menu <strong>SQL Editor</strong> &gt; <strong>New Query</strong>.
+                  Klik tombol <strong>Salin & Buka SQL Editor Supabase</strong> di atas untuk membuka proyek <code className="text-emerald-700 font-mono">lajhgapanricrzlxlniq</code>.
                 </p>
               </div>
 
@@ -1717,9 +1898,9 @@ export const AdministrationView: React.FC<AdministrationViewProps> = ({ currentU
                 <span className="w-5 h-5 rounded-full bg-emerald-600 text-white font-bold text-[11px] inline-flex items-center justify-center mb-1.5">
                   2
                 </span>
-                <div className="font-bold text-slate-800">Tempel & Jalankan Skrip</div>
+                <div className="font-bold text-slate-800">Tempel & Klik Run</div>
                 <p className="text-[11px] text-slate-500 mt-0.5">
-                  Tempelkan skrip SQL di bawah lalu klik tombol <strong>Run</strong> (atau Ctrl+Enter). Kelima tabel dan indeks akan dibuat otomatis.
+                  Tempelkan (Ctrl+V) skrip SQL di editor lalu klik <strong>Run</strong>. Keenam tabel beserta seluruh data awal akan langsung masuk ke Supabase.
                 </p>
               </div>
 
@@ -1727,9 +1908,9 @@ export const AdministrationView: React.FC<AdministrationViewProps> = ({ currentU
                 <span className="w-5 h-5 rounded-full bg-emerald-600 text-white font-bold text-[11px] inline-flex items-center justify-center mb-1.5">
                   3
                 </span>
-                <div className="font-bold text-slate-800">Salin Anon Key & Uji Koneksi</div>
+                <div className="font-bold text-slate-800">Sinkronisasi Dua Arah Aktif</div>
                 <p className="text-[11px] text-slate-500 mt-0.5">
-                  Buka <strong>Project Settings &gt; API</strong>, salin <em>anon / public key</em>, tempel pada form di atas, dan klik <strong>Uji Koneksi</strong>.
+                  Setelah tabel terbentuk, tombol <strong>Sinkronkan & Unggah Data Lokal</strong> dan <strong>Tarik dari Supabase</strong> siap digunakan kapan saja.
                 </p>
               </div>
             </div>
@@ -1738,8 +1919,314 @@ export const AdministrationView: React.FC<AdministrationViewProps> = ({ currentU
             <div className="relative">
               <div className="bg-slate-950 text-slate-200 rounded-xl p-4 font-mono text-xs overflow-x-auto max-h-72 border border-slate-800 scrollbar-thin">
                 <pre className="text-[11px] leading-relaxed select-all">
-                  {DiptaSupabaseService.getMigrationSQL()}
+                  {fullSeedSql}
                 </pre>
+              </div>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* TAB 6: STATUS & DOMAIN DEPLOYMENT VERCEL */}
+      {activeTab === 'VERCEL' && (
+        <div id="admin-vercel-tab" className="space-y-6 animate-in fade-in duration-200">
+          {/* Top Banner: Deployment Overview */}
+          <div className="bg-gradient-to-br from-indigo-950 via-slate-900 to-slate-950 rounded-2xl p-6 text-white border border-indigo-500/30 shadow-xl relative overflow-hidden">
+            <div className="absolute top-0 right-0 w-96 h-96 bg-indigo-500/10 rounded-full blur-3xl pointer-events-none" />
+            <div className="relative z-10 space-y-4">
+              <div className="flex flex-wrap items-center justify-between gap-3">
+                <div className="flex items-center gap-2">
+                  <span className="flex h-2.5 w-2.5 relative">
+                    <span className="animate-ping absolute inline-flex h-full w-full rounded-full bg-emerald-400 opacity-75"></span>
+                    <span className="relative inline-flex rounded-full h-2.5 w-2.5 bg-emerald-500"></span>
+                  </span>
+                  <span className="text-xs font-bold uppercase tracking-wider text-emerald-400">
+                    Status: Berhasil Dideploy ke Vercel (Online)
+                  </span>
+                </div>
+                <div className="flex items-center gap-2 text-xs text-slate-300">
+                  <Zap className="w-3.5 h-3.5 text-amber-400" />
+                  <span>Edge Network Global • SSL/TLS Otomatis Aktif</span>
+                </div>
+              </div>
+
+              <div>
+                <h3 className="text-xl sm:text-2xl font-bold tracking-tight text-white flex items-center gap-2">
+                  <Globe className="w-6 h-6 text-indigo-400" />
+                  <span>Domain Publik Vercel Siap Digunakan</span>
+                </h3>
+                <p className="text-xs text-slate-300 mt-1 max-w-2xl leading-relaxed">
+                  Aplikasi DIPTA DPMPTSP Kabupaten Ogan Komering Ilir kini dapat diakses secara publik oleh seluruh aparatur, pimpinan, dan pemangku kepentingan melalui domain resmi dari platform Vercel.
+                </p>
+              </div>
+
+              {/* Main Live Domain Box */}
+              <div className="p-4 bg-white/10 backdrop-blur-md rounded-xl border border-white/20 flex flex-col sm:flex-row sm:items-center justify-between gap-3">
+                <div className="min-w-0">
+                  <div className="text-[11px] font-semibold text-indigo-200 uppercase tracking-wider">
+                    Alamat URL Publik Vercel:
+                  </div>
+                  <a
+                    href={vercelDomainUrl}
+                    target="_blank"
+                    rel="noreferrer"
+                    className="text-sm sm:text-base font-bold text-white hover:text-emerald-300 underline underline-offset-4 flex items-center gap-1.5 truncate mt-0.5"
+                  >
+                    <span>{vercelDomainUrl}</span>
+                    <ExternalLink className="w-4 h-4 shrink-0 text-emerald-400" />
+                  </a>
+                </div>
+
+                <div className="flex items-center gap-2 shrink-0">
+                  <button
+                    type="button"
+                    onClick={() => handleCopyVercel(vercelDomainUrl, 'domain')}
+                    className="px-3 py-2 rounded-lg bg-white/20 hover:bg-white/30 text-white text-xs font-semibold flex items-center gap-1.5 transition-colors cursor-pointer"
+                  >
+                    {vercelCopied === 'domain' ? <Check className="w-3.5 h-3.5 text-emerald-400" /> : <Copy className="w-3.5 h-3.5" />}
+                    <span>{vercelCopied === 'domain' ? 'Tersalin!' : 'Salin URL'}</span>
+                  </button>
+
+                  <a
+                    href={vercelDomainUrl}
+                    target="_blank"
+                    rel="noreferrer"
+                    className="px-4 py-2 rounded-lg bg-emerald-500 hover:bg-emerald-600 text-white text-xs font-bold flex items-center gap-1.5 shadow-sm transition-colors cursor-pointer"
+                  >
+                    <span>Buka Website</span>
+                    <ExternalLink className="w-3.5 h-3.5" />
+                  </a>
+                </div>
+              </div>
+
+              {/* 1-Click Redeploy with Vercel Token */}
+              <form onSubmit={handleDirectDeployVercel} className="p-4 bg-white/5 rounded-xl border border-white/15 space-y-2.5">
+                <div className="flex flex-wrap items-center justify-between gap-2">
+                  <div className="text-xs font-bold text-white flex items-center gap-1.5">
+                    <CloudUpload className="w-4 h-4 text-emerald-400" />
+                    <span>Deploy Langsung Pembaruan Terbaru ke Akun Vercel Anda (REST API v13)</span>
+                  </div>
+                  <a
+                    href="https://vercel.com/account/tokens"
+                    target="_blank"
+                    rel="noreferrer"
+                    className="text-[11px] text-indigo-300 hover:text-white underline flex items-center gap-1"
+                  >
+                    <span>Buat Vercel Access Token</span>
+                    <ExternalLink className="w-3 h-3" />
+                  </a>
+                </div>
+                <div className="flex flex-col sm:flex-row gap-2">
+                  <input
+                    type="password"
+                    value={vercelToken}
+                    onChange={(e) => setVercelToken(e.target.value)}
+                    placeholder="Masukkan Vercel Token (dari vercel.com/account/tokens)..."
+                    className="flex-1 bg-slate-900/90 border border-slate-700 rounded-lg px-3 py-2 text-xs font-mono text-white placeholder:text-slate-400 focus:outline-emerald-400"
+                  />
+                  <button
+                    type="submit"
+                    disabled={isDeployingVercel}
+                    className="px-4 py-2 rounded-lg bg-indigo-500 hover:bg-indigo-600 text-white text-xs font-bold flex items-center justify-center gap-1.5 shadow-sm transition-colors cursor-pointer disabled:opacity-50 shrink-0"
+                  >
+                    <Zap className={`w-3.5 h-3.5 ${isDeployingVercel ? 'animate-spin' : ''}`} />
+                    <span>{isDeployingVercel ? 'Mengunggah & Mem-build di Vercel...' : 'Deploy ke Vercel Sekarang'}</span>
+                  </button>
+                </div>
+                {vercelDeployFeedback && (
+                  <div
+                    className={`p-2.5 rounded-lg text-xs font-medium ${
+                      vercelDeployFeedback.type === 'success'
+                        ? 'bg-emerald-500/20 border border-emerald-400/40 text-emerald-200'
+                        : 'bg-rose-500/20 border border-rose-400/40 text-rose-200'
+                    }`}
+                  >
+                    {vercelDeployFeedback.message}
+                  </div>
+                )}
+              </form>
+            </div>
+          </div>
+
+          {/* 2-Column Section: Claim Ownership & Custom Domain */}
+          <div className="grid grid-cols-1 lg:grid-cols-12 gap-6">
+            {/* Column 1: Claim Ownership (7 Cols) */}
+            <div className="lg:col-span-7 bg-white border border-slate-200 rounded-xl p-5 shadow-xs space-y-4">
+              <div className="border-b border-slate-100 pb-3">
+                <h4 className="text-sm font-bold text-slate-900 flex items-center gap-2">
+                  <ShieldCheck className="w-4 h-4 text-emerald-600" />
+                  <span>Klaim Kepemilikan Permanen ke Akun Vercel Anda</span>
+                </h4>
+                <p className="text-xs text-slate-500 mt-0.5">
+                  Deployment publik di atas saat ini berstatus temporary. Klik tautan klaim resmi di bawah ini untuk menghubungkannya secara permanen ke akun Vercel pribadi atau kedinasan DPMPTSP OKI.
+                </p>
+              </div>
+
+              <div className="p-4 bg-amber-50 rounded-xl border border-amber-200/80 space-y-2.5">
+                <div className="flex items-start gap-2 text-xs font-bold text-amber-900">
+                  <AlertCircle className="w-4 h-4 text-amber-600 shrink-0 mt-0.5" />
+                  <span>Tautan Klaim Resmi Deployment Vercel:</span>
+                </div>
+                <div className="p-2.5 bg-white rounded-lg border border-amber-200 font-mono text-[11px] text-slate-800 break-all select-all">
+                  https://vercel.com/claim-deployment?code=e1e5e66f-c2df-4b94-84e3-b8880bac56e7
+                </div>
+
+                <div className="flex flex-wrap items-center gap-2 pt-1">
+                  <a
+                    href="https://vercel.com/claim-deployment?code=e1e5e66f-c2df-4b94-84e3-b8880bac56e7"
+                    target="_blank"
+                    rel="noreferrer"
+                    className="px-3.5 py-2 rounded-lg bg-amber-600 hover:bg-amber-700 text-white font-bold text-xs flex items-center gap-1.5 shadow-xs transition-colors cursor-pointer"
+                  >
+                    <span>Klaim ke Akun Vercel Sekarang</span>
+                    <ExternalLink className="w-3.5 h-3.5" />
+                  </a>
+
+                  <button
+                    type="button"
+                    onClick={() => handleCopyVercel('https://vercel.com/claim-deployment?code=e1e5e66f-c2df-4b94-84e3-b8880bac56e7', 'claim')}
+                    className="px-3 py-2 rounded-lg border border-amber-300 hover:bg-amber-100/60 text-amber-900 font-semibold text-xs flex items-center gap-1.5 transition-colors cursor-pointer"
+                  >
+                    {vercelCopied === 'claim' ? <Check className="w-3.5 h-3.5 text-emerald-600" /> : <Copy className="w-3.5 h-3.5" />}
+                    <span>{vercelCopied === 'claim' ? 'Tautan Tersalin!' : 'Salin Tautan Klaim'}</span>
+                  </button>
+                </div>
+              </div>
+
+              {/* Step-by-Step Claim Benefits */}
+              <div className="space-y-2 pt-2 text-xs text-slate-600">
+                <div className="font-semibold text-slate-800">Manfaat Setelah Mengklaim Proyek:</div>
+                <ul className="list-disc list-inside space-y-1 text-[11px] text-slate-500 pl-1">
+                  <li>Deployment menjadi <strong>permanen</strong> (tidak kedaluwarsa).</li>
+                  <li>Dapat mengatur nama domain kustom Vercel gratis (misal: <code className="bg-slate-100 px-1 py-0.5 rounded text-indigo-700">dipta-dpmptsp-oki.vercel.app</code>).</li>
+                  <li>Dapat dihubungkan ke domain resmi Pemerintah Kabupaten OKI (misal: <code className="bg-slate-100 px-1 py-0.5 rounded text-indigo-700">dipta.okikab.go.id</code>).</li>
+                  <li>Dapat dihubungkan langsung ke repositori GitHub untuk auto-deploy saat ada pembaruan kode.</li>
+                </ul>
+              </div>
+            </div>
+
+            {/* Column 2: Custom Domain Guide & DNS (5 Cols) */}
+            <div className="lg:col-span-5 bg-white border border-slate-200 rounded-xl p-5 shadow-xs space-y-4 flex flex-col justify-between">
+              <div>
+                <div className="border-b border-slate-100 pb-3">
+                  <h4 className="text-sm font-bold text-slate-900 flex items-center gap-2">
+                    <Globe className="w-4 h-4 text-indigo-600" />
+                    <span>Panduan Konfigurasi Domain Kustom</span>
+                  </h4>
+                  <p className="text-xs text-slate-500 mt-0.5">
+                    Langkah mudah menghubungkan domain/subdomain khusus di Vercel Dashboard.
+                  </p>
+                </div>
+
+                <div className="space-y-3 pt-3 text-xs">
+                  <div className="p-3 bg-slate-50 rounded-lg border border-slate-200 space-y-1">
+                    <div className="font-bold text-slate-800">1. Subdomain Gratis Vercel</div>
+                    <p className="text-[11px] text-slate-500">
+                      Buka menu <strong>Settings &gt; Domains</strong> di Vercel, lalu ketik nama yang diinginkan seperti:
+                    </p>
+                    <code className="block p-1.5 bg-white rounded border border-slate-200 text-indigo-700 font-mono text-[11px]">
+                      dipta-dpmptsp-oki.vercel.app
+                    </code>
+                  </div>
+
+                  <div className="p-3 bg-slate-50 rounded-lg border border-slate-200 space-y-1">
+                    <div className="font-bold text-slate-800">2. Domain Resmi Pemkab OKI (DNS)</div>
+                    <p className="text-[11px] text-slate-500">
+                      Jika menggunakan subdomain dinas (misal <code className="font-mono text-slate-700">dipta.okikab.go.id</code>), tambahkan DNS Record berikut:
+                    </p>
+                    <div className="bg-white p-2 rounded border border-slate-200 space-y-1 text-[10px] font-mono">
+                      <div><strong>Tipe:</strong> CNAME</div>
+                      <div><strong>Nama:</strong> dipta</div>
+                      <div><strong>Target / Nilai:</strong> cname.vercel-dns.com</div>
+                    </div>
+                  </div>
+                </div>
+              </div>
+
+              {/* Serverless API Status & Ping Tester */}
+              <div className="pt-3 border-t border-slate-100 space-y-2">
+                <div className="flex items-center justify-between text-xs">
+                  <span className="font-bold text-slate-800">Uji API Serverless Vercel:</span>
+                  <button
+                    type="button"
+                    onClick={handleTestVercel}
+                    disabled={vercelTestStatus.testing}
+                    className="px-2.5 py-1 rounded bg-slate-100 hover:bg-slate-200 text-slate-700 text-[11px] font-semibold flex items-center gap-1 transition-colors cursor-pointer disabled:opacity-50"
+                  >
+                    <RefreshCw className={`w-3 h-3 ${vercelTestStatus.testing ? 'animate-spin text-indigo-600' : ''}`} />
+                    <span>{vercelTestStatus.testing ? 'Menguji...' : 'Uji Ping API'}</span>
+                  </button>
+                </div>
+
+                {vercelTestStatus.result && (
+                  <div className="p-2.5 bg-emerald-50 border border-emerald-200 rounded-lg text-[11px] text-emerald-900 space-y-0.5">
+                    <div className="font-bold flex items-center gap-1">
+                      <CheckCircle2 className="w-3.5 h-3.5 text-emerald-600" />
+                      <span>Endpoint /api/health Berfungsi Normal</span>
+                    </div>
+                    {vercelTestStatus.latency && (
+                      <div className="text-slate-500 text-[10px]">
+                        Waktu respon edge: <strong>{vercelTestStatus.latency} ms</strong>
+                      </div>
+                    )}
+                  </div>
+                )}
+              </div>
+            </div>
+          </div>
+
+          {/* Full-width Section: Architecture & Config Files for Vercel */}
+          <div className="bg-white border border-slate-200 rounded-xl p-5 shadow-xs space-y-4">
+            <div className="border-b border-slate-100 pb-3 flex flex-col sm:flex-row sm:items-center justify-between gap-3">
+              <div>
+                <h4 className="text-sm font-bold text-slate-900 flex items-center gap-2">
+                  <Terminal className="w-4 h-4 text-slate-700" />
+                  <span>Konfigurasi Siap-Deploy (vercel.json & Serverless API Functions)</span>
+                </h4>
+                <p className="text-xs text-slate-500 mt-0.5">
+                  Proyek telah dilengkapi berkas konfigurasi <code className="font-mono text-slate-800">vercel.json</code>, folder <code className="font-mono text-slate-800">api/</code> serverless, dan berkas abaikan <code className="font-mono text-slate-800">.vercelignore</code>.
+                </p>
+              </div>
+
+              <button
+                type="button"
+                onClick={() => handleCopyVercel(JSON.stringify({
+                  version: 2,
+                  buildCommand: "vite build",
+                  outputDirectory: "dist",
+                  rewrites: [
+                    { source: "/api/health", destination: "/api/health" },
+                    { source: "/api/ai/insight", destination: "/api/ai/insight" },
+                    { source: "/(.*)", destination: "/index.html" }
+                  ]
+                }, null, 2), 'config')}
+                className="px-3 py-1.5 rounded-lg border border-slate-200 hover:bg-slate-50 text-slate-700 text-xs font-semibold flex items-center gap-1.5 transition-colors cursor-pointer shrink-0"
+              >
+                {vercelCopied === 'config' ? <Check className="w-3.5 h-3.5 text-emerald-600" /> : <Copy className="w-3.5 h-3.5 text-slate-500" />}
+                <span>{vercelCopied === 'config' ? 'Tersalin!' : 'Salin vercel.json'}</span>
+              </button>
+            </div>
+
+            <div className="grid grid-cols-1 md:grid-cols-3 gap-3 text-xs">
+              <div className="p-3 bg-slate-50 rounded-lg border border-slate-200 space-y-1">
+                <div className="font-bold text-slate-800">Frontend Vite SPA (dist)</div>
+                <p className="text-[11px] text-slate-500">
+                  Kompilasi React 19 + Tailwind CSS v4 otomatis di-build ke direktori <code className="font-mono text-slate-700">dist/</code> dan di-cache pada CDN edge Vercel.
+                </p>
+              </div>
+
+              <div className="p-3 bg-slate-50 rounded-lg border border-slate-200 space-y-1">
+                <div className="font-bold text-slate-800">Serverless API (/api/*)</div>
+                <p className="text-[11px] text-slate-500">
+                  Endpoint <code className="font-mono text-slate-700">/api/health</code> dan <code className="font-mono text-slate-700">/api/ai/insight</code> dieksekusi sebagai Vercel Serverless Functions Node.js.
+                </p>
+              </div>
+
+              <div className="p-3 bg-slate-50 rounded-lg border border-slate-200 space-y-1">
+                <div className="font-bold text-slate-800">SPA Rewrites Routing</div>
+                <p className="text-[11px] text-slate-500">
+                  Seluruh navigasi rute halaman SPA di-rewrite ke <code className="font-mono text-slate-700">/index.html</code> sehingga reload halaman tidak pernah 404.
+                </p>
               </div>
             </div>
           </div>

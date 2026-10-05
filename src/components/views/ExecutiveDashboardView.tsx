@@ -497,7 +497,7 @@ export const ExecutiveDashboardView: React.FC<ExecutiveDashboardViewProps> = ({
         </div>
       </div>
 
-      {/* Grafik 5: Distribusi Kecamatan di Ogan Komering Ilir dengan Google Maps & OSM */}
+      {/* Grafik 5: Distribusi Kecamatan di Ogan Komering Ilir dengan Google Maps */}
       <div id="chart-distribusi-kecamatan" className="bg-white border border-slate-200 rounded-xl p-5 shadow-xs">
         <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3 mb-4">
           <div className="flex items-center gap-2">
@@ -512,7 +512,7 @@ export const ExecutiveDashboardView: React.FC<ExecutiveDashboardViewProps> = ({
                 </span>
               </div>
               <p className="text-[11px] text-slate-500">
-                Peta geospasial interaktif (Google Maps Platform & OpenStreetMap) dengan batas teritori 18 kecamatan di Kab. Ogan Komering Ilir
+                Peta geospasial interaktif Google Maps dengan batas teritori 18 kecamatan di Kab. Ogan Komering Ilir
               </p>
             </div>
           </div>
@@ -528,7 +528,7 @@ export const ExecutiveDashboardView: React.FC<ExecutiveDashboardViewProps> = ({
               }`}
             >
               <MapIcon className="w-3.5 h-3.5" />
-              <span>Peta Wilayah (Google Maps & OSM)</span>
+              <span>Peta Wilayah (Google Maps)</span>
             </button>
             <button
               onClick={() => setKecamatanViewMode('chart')}

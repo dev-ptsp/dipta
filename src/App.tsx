@@ -15,11 +15,19 @@ import { DataQualityView } from './components/views/DataQualityView';
 import { ImportModuleView } from './components/views/ImportModuleView';
 import { AuditTrailView } from './components/views/AuditTrailView';
 import { AdministrationView } from './components/views/AdministrationView';
+import { LoginView } from './components/views/LoginView';
+import { LaporanPelayananView } from './components/views/LaporanPelayananView';
+import { DiptaSupabaseService } from './services/supabaseClient';
 
 // Ensure storage is initialized and clean on application startup
 DiptaStorageService.init();
 
 export default function App() {
+  // Authentication state
+  const [isAuthenticated, setIsAuthenticated] = useState<boolean>(() => {
+    return DiptaStorageService.isAuthenticated();
+  });
+
   // Current logged in user (defaults to Project Leader: Eva Kaparina, S.Sos)
   const [currentUser, setCurrentUser] = useState<User>(() => {
     const allUsers = DiptaStorageService.getAllUsers();
@@ -28,7 +36,14 @@ export default function App() {
 
   // Active navigation view
   const [activeView, setActiveView] = useState<ActiveView>('executive_dashboard');
-  const [adminInitialTab, setAdminInitialTab] = useState<'USERS' | 'ROLES' | 'MAPPING' | 'KECAMATAN' | 'DATABASE'>('USERS');
+  const [adminInitialTab, setAdminInitialTab] = useState<'USERS' | 'ROLES' | 'MAPPING' | 'KECAMATAN' | 'DATABASE' | 'VERCEL'>('USERS');
+  const [gmpQuotaExceeded, setGmpQuotaExceeded] = useState<boolean>(false);
+
+  useEffect(() => {
+    const handleQuotaExceeded = () => setGmpQuotaExceeded(true);
+    window.addEventListener('gmp-quota-exceeded', handleQuotaExceeded);
+    return () => window.removeEventListener('gmp-quota-exceeded', handleQuotaExceeded);
+  }, []);
 
   // Core Data loaded from storage
   const [records, setRecords] = useState<DiptaRecord[]>(() => DiptaStorageService.getAllRecords());
@@ -58,6 +73,27 @@ export default function App() {
 
   useEffect(() => {
     reloadData();
+
+    // If Supabase is configured, pull latest data & subscribe to real-time updates
+    if (DiptaSupabaseService.getConfig().isConfigured) {
+      DiptaStorageService.loadAllFromSupabase().then(res => {
+        if (res.success) {
+          reloadData();
+        }
+      });
+
+      const unsubscribe = DiptaSupabaseService.subscribeToRealtime(() => {
+        DiptaStorageService.loadAllFromSupabase().then(res => {
+          if (res.success) {
+            reloadData();
+          }
+        });
+      });
+
+      return () => {
+        unsubscribe();
+      };
+    }
   }, []);
 
   // Filter computation
@@ -125,6 +161,24 @@ export default function App() {
     reloadData();
   };
 
+  const handleLogout = () => {
+    DiptaStorageService.logout();
+    setIsAuthenticated(false);
+  };
+
+  // If user is not authenticated, display the modern Login View with official logo
+  if (!isAuthenticated) {
+    return (
+      <LoginView
+        onLoginSuccess={(user) => {
+          setCurrentUser(user);
+          setIsAuthenticated(true);
+          reloadData();
+        }}
+      />
+    );
+  }
+
   // Determine if the current view should display the unified GlobalFilterBar
   const showFilterBar =
     activeView === 'executive_dashboard' ||
@@ -134,6 +188,23 @@ export default function App() {
 
   return (
     <div className="min-h-screen flex flex-col bg-slate-100 text-slate-900">
+      {gmpQuotaExceeded && (
+        <div className="bg-amber-50 border-b border-amber-200 text-amber-900 px-4 py-2.5 text-xs md:text-sm text-center sticky top-0 z-50 shadow-sm">
+          <span>
+            Google Maps Platform quota reached. If you are the app owner, visit{' '}
+            <a
+              href="https://developers.google.com/maps/ai/ai-studio?utm_campaign=gmp_mcp_codeassist_v1_aistudio#quota_exceeded_errors"
+              target="_blank"
+              rel="noopener noreferrer"
+              className="underline font-semibold text-amber-950 hover:text-amber-800"
+            >
+              maps developer site
+            </a>{' '}
+            for instructions to update your account.
+          </span>
+        </div>
+      )}
+
       {/* Top Application Header */}
       <Header
         currentUser={currentUser}
@@ -141,6 +212,7 @@ export default function App() {
         openIssuesCount={openIssuesCount}
         onNavigateToQuality={() => setActiveView('data_quality')}
         onResetData={handleResetData}
+        onLogout={handleLogout}
         onOpenDatabase={() => {
           setAdminInitialTab('DATABASE');
           setActiveView('administration');
@@ -151,14 +223,15 @@ export default function App() {
       <div className="flex-1 flex overflow-hidden">
         <Sidebar
           activeView={activeView}
-          onNavigate={(view) => {
+          onNavigate={(view, tab) => {
             if (view === 'administration') {
-              setAdminInitialTab('USERS');
+              setAdminInitialTab(tab || 'USERS');
             }
             setActiveView(view);
           }}
           currentUser={currentUser}
           qualityIssuesCount={openIssuesCount}
+          onLogout={handleLogout}
         />
 
         {/* Workspace Content Canvas */}
@@ -210,6 +283,7 @@ export default function App() {
                 title="Monitoring Pelayanan — Seluruh Sumber"
                 subtitle="Daftar transaksi konsolidasi dari OSS-RBA, SICANTIK Cloud, dan SIMBG di Kab. Ogan Komering Ilir."
                 currentUser={currentUser}
+                onDataRefresh={reloadData}
               />
             )}
 
@@ -220,6 +294,7 @@ export default function App() {
                 title="Monitoring Pelayanan — OSS-RBA"
                 subtitle="Data transaksi perizinan berusaha berbasis risiko dari Online Single Submission (OSS-RBA)."
                 currentUser={currentUser}
+                onDataRefresh={reloadData}
               />
             )}
 
@@ -230,6 +305,7 @@ export default function App() {
                 title="Monitoring Pelayanan — SICANTIK Cloud"
                 subtitle="Data transaksi perizinan dan non-perizinan daerah dari aplikasi cerdas terpadu satu pintu (SICANTIK Cloud)."
                 currentUser={currentUser}
+                onDataRefresh={reloadData}
               />
             )}
 
@@ -240,6 +316,7 @@ export default function App() {
                 title="Monitoring Pelayanan — SIMBG (PBG / SLF)"
                 subtitle="Data transaksi Persetujuan Bangunan Gedung dan Sertifikat Laik Fungsi dari SIMBG."
                 currentUser={currentUser}
+                onDataRefresh={reloadData}
               />
             )}
 
@@ -255,12 +332,37 @@ export default function App() {
               <AnalyticsSimbgView records={filteredRecords} />
             )}
 
+            {activeView === 'laporan_bulanan' && (
+              <LaporanPelayananView
+                records={records}
+                currentUser={currentUser}
+                initialMode="BULANAN"
+              />
+            )}
+
+            {activeView === 'laporan_mingguan' && (
+              <LaporanPelayananView
+                records={records}
+                currentUser={currentUser}
+                initialMode="MINGGUAN"
+              />
+            )}
+
+            {activeView === 'laporan_tanggal' && (
+              <LaporanPelayananView
+                records={records}
+                currentUser={currentUser}
+                initialMode="RENTANG_TANGGAL"
+              />
+            )}
+
             {activeView === 'data_recap' && (
               <MonitoringPelayananView
                 records={filteredRecords}
                 title="Data & Rekapitulasi Pelayanan Terpadu"
                 subtitle="Tabel induk rekapitulasi data dengan kemampuan filter komprehensif dan ekspor laporan Excel."
                 currentUser={currentUser}
+                onDataRefresh={reloadData}
               />
             )}
 

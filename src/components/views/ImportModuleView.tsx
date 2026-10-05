@@ -150,7 +150,10 @@ export const ImportModuleView: React.FC<ImportModuleViewProps> = ({
         selectedSource,
         selectedDataset,
         existingRecords,
-        rules
+        rules,
+        'TINJAU_PERBEDAAN',
+        idx,
+        periodeData
       );
 
       if (res.isValid && res.record) {
@@ -158,11 +161,15 @@ export const ImportModuleView: React.FC<ImportModuleViewProps> = ({
         if (res.record.status_validasi === 'PERLU_VERIFIKASI') issuesCount++;
         if (res.record.status_validasi === 'DUPLIKAT') duplicateCount++;
       } else {
-        invalidRows.push({
-          row: rowNum,
-          reason: res.errors.length > 0 ? res.errors.join(', ') : 'Data tidak memenuhi syarat mandatory',
-          data: row
-        });
+        // Ignore completely empty trailing Excel rows from counting as invalid errors
+        const isBlankRow = res.errors.some(e => e.includes('Baris kosong'));
+        if (!isBlankRow) {
+          invalidRows.push({
+            row: rowNum,
+            reason: res.errors.length > 0 ? res.errors.join(', ') : 'Data tidak memenuhi syarat mandatory',
+            data: row
+          });
+        }
       }
     });
 
@@ -176,6 +183,92 @@ export const ImportModuleView: React.FC<ImportModuleViewProps> = ({
     setCurrentStep(2);
   };
 
+  // Smart Excel sheet & header detector (handles multi-sheet workbooks and title rows above table headers)
+  const extractRowsFromWorkbook = (workbook: XLSX.WorkBook, targetDataset: DatasetCode): { headers: string[]; rows: any[] } => {
+    // 1. Pick the best matching sheet if workbook has multiple sheets (e.g. Master Bundle 5 Sheet)
+    const sheetHints: Record<DatasetCode, string[]> = {
+      OSS_NIB: ['nib', '1_oss_nib', 'data_oss_nib'],
+      OSS_KEGIATAN: ['kegiatan', 'proyek', '2_oss_kegiatan', 'data_oss_kegiatan'],
+      OSS_IZIN: ['izin', 'produk', 'dokumen', '3_oss_izin', 'data_oss_izin'],
+      SICANTIK: ['sicantik', '4_sicantik', 'data_sicantik'],
+      SIMBG: ['simbg', 'pbg', 'bangunan', '5_simbg', 'data_simbg']
+    };
+
+    const hints = sheetHints[targetDataset] || [];
+    let chosenSheetName = workbook.SheetNames[0];
+
+    for (const sName of workbook.SheetNames) {
+      const lower = sName.toLowerCase();
+      if (lower.includes('panduan')) continue;
+      if (hints.some(h => lower.includes(h))) {
+        chosenSheetName = sName;
+        break;
+      }
+    }
+
+    // Also avoid picking PANDUAN sheet if it happens to be first
+    if (chosenSheetName.toLowerCase().includes('panduan') && workbook.SheetNames.length > 1) {
+      const nonGuide = workbook.SheetNames.find(s => !s.toLowerCase().includes('panduan'));
+      if (nonGuide) chosenSheetName = nonGuide;
+    }
+
+    const worksheet = workbook.Sheets[chosenSheetName];
+
+    // 2. Read as 2D array first to find the actual header row (in case exported files have title rows on row 1-5)
+    const rawMatrix: any[][] = XLSX.utils.sheet_to_json(worksheet, { header: 1, defval: '' });
+    if (!rawMatrix || rawMatrix.length === 0) {
+      return { headers: [], rows: [] };
+    }
+
+    const knownHeaderKeywords = [
+      'nib', 'proyek', 'perizinan', 'permohonan', 'registrasi', 'perusahaan', 'usaha',
+      'pemohon', 'kbli', 'kecamatan', 'status', 'tanggal', 'tgl', 'izin', 'dokumen', 'lokasi', 'sektor', 'investasi'
+    ];
+
+    let headerRowIndex = 0;
+    let bestScore = -1;
+
+    for (let r = 0; r < Math.min(rawMatrix.length, 12); r++) {
+      const rowCells = (rawMatrix[r] || []).map(c => String(c || '').trim().toLowerCase());
+      const nonEmptyCount = rowCells.filter(Boolean).length;
+      if (nonEmptyCount < 2) continue;
+
+      let matchCount = 0;
+      rowCells.forEach(cell => {
+        if (knownHeaderKeywords.some(kw => cell.includes(kw))) {
+          matchCount++;
+        }
+      });
+
+      const score = matchCount * 3 + nonEmptyCount;
+      if (matchCount >= 1 && score > bestScore) {
+        bestScore = score;
+        headerRowIndex = r;
+      }
+    }
+
+    const rawHeaderCells = (rawMatrix[headerRowIndex] || []).map((c, idx) => {
+      const val = String(c || '').trim();
+      return val || `Kolom_${idx + 1}`;
+    });
+
+    const dataRows: any[] = [];
+    for (let r = headerRowIndex + 1; r < rawMatrix.length; r++) {
+      const rowArr = rawMatrix[r] || [];
+      // Check if row has at least one non-empty value
+      const hasValue = rowArr.some(cell => cell !== undefined && cell !== null && String(cell).trim() !== '');
+      if (!hasValue) continue;
+
+      const rowObj: Record<string, any> = {};
+      rawHeaderCells.forEach((hKey, cIdx) => {
+        rowObj[hKey] = rowArr[cIdx] !== undefined && rowArr[cIdx] !== null ? rowArr[cIdx] : '';
+      });
+      dataRows.push(rowObj);
+    }
+
+    return { headers: rawHeaderCells, rows: dataRows };
+  };
+
   // Upload file handler
   const handleFileUpload = (e: React.ChangeEvent<HTMLInputElement>) => {
     const file = e.target.files?.[0];
@@ -183,33 +276,37 @@ export const ImportModuleView: React.FC<ImportModuleViewProps> = ({
 
     const reader = new FileReader();
     reader.onload = evt => {
-      const data = new Uint8Array(evt.target?.result as ArrayBuffer);
-      const workbook = XLSX.read(data, { type: 'array' });
-      const firstSheetName = workbook.SheetNames[0];
-      const worksheet = workbook.Sheets[firstSheetName];
-      const json: any[] = XLSX.utils.sheet_to_json(worksheet, { defval: '' });
+      try {
+        const data = new Uint8Array(evt.target?.result as ArrayBuffer);
+        const workbook = XLSX.read(data, { type: 'array' });
+        const { headers, rows } = extractRowsFromWorkbook(workbook, selectedDataset);
 
-      if (json.length === 0) {
-        alert('File Excel kosong atau format tidak sesuai.');
-        return;
+        if (rows.length === 0) {
+          setTemplateDownloadMsg('Berkas Excel yang dipilih kosong atau tidak memiliki baris data.');
+          return;
+        }
+
+        processDataRows(headers, rows, file.name);
+      } catch (err: any) {
+        setTemplateDownloadMsg(`Gagal membaca berkas Excel: ${err?.message || 'Format tidak didukung'}`);
       }
-
-      const headers = Object.keys(json[0]);
-      processDataRows(headers, json, file.name);
     };
     reader.readAsArrayBuffer(file);
+    // Reset input value so the same file can be re-selected if needed
+    e.target.value = '';
   };
 
   // Preloaded Sample Data (For immediate interactive testing of UAT scenarios)
   const handleLoadSampleData = () => {
-    const sample = SAMPLE_RAW_DATASETS[selectedDataset];
-    if (!sample) return;
+    const sample = DiptaStorageService.getSampleImportData(selectedDataset) || SAMPLE_RAW_DATASETS[selectedDataset];
+    if (!sample || sample.length === 0) return;
     const headers = Object.keys(sample[0]);
     processDataRows(headers, sample, `sample_${selectedDataset.toLowerCase()}_kab_oki.xlsx`);
   };
 
   // Confirm Import
   const handleConfirmImport = () => {
+    if (validationResults.validRecords.length === 0) return;
     setIsProcessing(true);
     setTimeout(() => {
       const newBatchId = `BATCH-${Date.now()}`;
@@ -233,14 +330,16 @@ export const ImportModuleView: React.FC<ImportModuleViewProps> = ({
         notes: `Import melalui modul wizard DIPTA (${selectedDataset})`
       };
 
-      // Add records into storage
+      // Add records into storage (preserve nib, id_proyek, and all domain fields!)
       const fullRecordsToSave: DiptaRecord[] = validationResults.validRecords.map((partial, i) => ({
-        id_dipta: `DIPTA-${Date.now()}-${i + 1}`,
+        id_dipta: partial.id_dipta || `DIPTA-${Date.now()}-${i + 1}`,
         batch_id: newBatchId,
         sumber_aplikasi: selectedSource,
         jenis_dataset: selectedDataset,
         id_record_sumber: partial.id_record_sumber || `REC-${i + 1}`,
         nomor_permohonan: partial.nomor_permohonan,
+        nib: partial.nib,
+        id_proyek: partial.id_proyek,
         nama_pemohon_usaha: partial.nama_pemohon_usaha || 'Pemohon Terdata',
         kelompok_layanan: partial.kelompok_layanan || 'Perizinan',
         jenis_layanan: partial.jenis_layanan || 'Layanan Standar',
@@ -253,7 +352,7 @@ export const ImportModuleView: React.FC<ImportModuleViewProps> = ({
         status_dipta: partial.status_dipta || 'SELESAI_TERBIT',
         status_validasi: partial.status_validasi || 'VALID',
         catatan_validasi: partial.catatan_validasi,
-        periode_data: periodeData,
+        periode_data: partial.periode_data || periodeData,
         durasi_hari: partial.durasi_hari,
         investasi_rupiah: partial.investasi_rupiah,
         tki_count: partial.tki_count,
@@ -270,6 +369,7 @@ export const ImportModuleView: React.FC<ImportModuleViewProps> = ({
         subfungsi_bangunan: partial.subfungsi_bangunan,
         luas_m2: partial.luas_m2,
         jumlah_lantai: partial.jumlah_lantai,
+        jumlah_unit: partial.jumlah_unit,
         tanggal_update_dipta: new Date().toISOString().replace('T', ' ').substring(0, 19),
         operator_update: currentUser.full_name
       }));
@@ -278,7 +378,7 @@ export const ImportModuleView: React.FC<ImportModuleViewProps> = ({
       setCompletedBatch(newBatch);
       setIsProcessing(false);
       setCurrentStep(3);
-    }, 600);
+    }, 400);
   };
 
   return (

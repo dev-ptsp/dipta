@@ -1,11 +1,17 @@
 // DIPTA - Peta Interaktif Kabupaten Ogan Komering Ilir
-// Mendukung Google Maps Platform & OpenStreetMap (OSM) dengan Batas Wilayah 18 Kecamatan & Layer Heatmap Kerapatan
-import React, { useEffect, useRef, useState, useMemo } from 'react';
+// Menggunakan @vis.gl/react-google-maps dengan Batas Wilayah Asli Google Maps, Places API (New) Viewport Fitting, AdvancedMarker, & Layer Kerapatan Layanan
+import React, { useEffect, useRef, useState, useMemo, useCallback } from 'react';
+import {
+  APIProvider,
+  Map,
+  AdvancedMarker,
+  InfoWindow,
+  useMap,
+  useMapsLibrary
+} from '@vis.gl/react-google-maps';
 import { DiptaRecord } from '../../types';
 import { OKI_KECAMATAN_GEO, OKI_MAP_CENTER, OKI_DEFAULT_ZOOM, KecamatanGeo } from '../../data/okiGeodata';
 import {
-  Layers,
-  MapPin,
   ExternalLink,
   RotateCcw,
   ZoomIn,
@@ -16,68 +22,9 @@ import {
   Sliders,
   Filter,
   Eye,
-  EyeOff
+  EyeOff,
+  MapPin
 } from 'lucide-react';
-import L from 'leaflet';
-
-declare global {
-  interface Window {
-    google?: any;
-    L?: any;
-    __googleMapsLoaded?: boolean;
-    __googleMapsCallbacks?: Array<(google: any) => void>;
-  }
-}
-
-// Ensure Leaflet is attached globally for leaflet-heat plugin
-if (typeof window !== 'undefined') {
-  window.L = L;
-}
-
-function loadGoogleMapsScript(apiKey: string): Promise<any> {
-  if (typeof window === 'undefined') return Promise.reject(new Error('Window not available'));
-  if (window.google?.maps?.visualization) {
-    return Promise.resolve(window.google);
-  }
-
-  if (window.__googleMapsLoaded && window.google?.maps) {
-    return Promise.resolve(window.google);
-  }
-
-  if (!window.__googleMapsCallbacks) {
-    window.__googleMapsCallbacks = [];
-  }
-
-  return new Promise((resolve, reject) => {
-    window.__googleMapsCallbacks!.push(resolve);
-
-    const existingScript = document.getElementById('google-maps-api-script');
-    if (existingScript) {
-      if (window.google?.maps) {
-        resolve(window.google);
-      }
-      return;
-    }
-
-    const script = document.createElement('script');
-    script.id = 'google-maps-api-script';
-    script.src = `https://maps.googleapis.com/maps/api/js?key=${apiKey}&libraries=places,geometry,visualization`;
-    script.async = true;
-    script.defer = true;
-    script.onload = () => {
-      window.__googleMapsLoaded = true;
-      const g = window.google;
-      if (window.__googleMapsCallbacks) {
-        window.__googleMapsCallbacks.forEach(cb => cb(g));
-        window.__googleMapsCallbacks = [];
-      }
-    };
-    script.onerror = () => {
-      reject(new Error('Failed to load Google Maps script'));
-    };
-    document.head.appendChild(script);
-  });
-}
 
 interface OkiInteractiveMapProps {
   records: DiptaRecord[];
@@ -85,9 +32,7 @@ interface OkiInteractiveMapProps {
   selectedKecamatan?: string;
 }
 
-type MapProvider = 'google' | 'osm';
 type GoogleMapType = 'roadmap' | 'satellite' | 'hybrid' | 'terrain';
-type OsmTileStyle = 'standard' | 'humanitarian' | 'carto';
 type HeatmapDatasetFilter = 'ALL' | 'OSS-RBA' | 'SICANTIK' | 'SIMBG';
 
 interface HeatPoint {
@@ -98,41 +43,224 @@ interface HeatPoint {
   source?: string;
 }
 
-const GOOGLE_MAPS_KEY =
-  (import.meta.env.VITE_GOOGLE_MAPS_API_KEY as string) ||
-  'AIzaSyDFidUy4YRt1Ymrb0pSf1P25wyEd-vniHY';
+const GOOGLE_MAPS_API_KEY = (import.meta.env.VITE_GOOGLE_MAPS_API_KEY as string) || '';
+
+interface MapOverlaysProps {
+  googleType: GoogleMapType;
+  showHeatmap: boolean;
+  heatmapRadius: number;
+  heatmapPoints: HeatPoint[];
+  onPlaceViewportResolved: (kecName: string, centerPos: { lat: number; lng: number }, formattedAddress?: string) => void;
+  mapActionRef: React.MutableRefObject<{
+    zoomIn: () => void;
+    zoomOut: () => void;
+    resetCenter: () => void;
+    focusKecamatanByGoogleMaps: (kec: KecamatanGeo) => void;
+  } | null>;
+}
+
+const OkiMapOverlays: React.FC<MapOverlaysProps> = ({
+  googleType,
+  showHeatmap,
+  heatmapRadius,
+  heatmapPoints,
+  onPlaceViewportResolved,
+  mapActionRef
+}) => {
+  const map = useMap();
+  const placesLib = useMapsLibrary('places');
+  const circlesRef = useRef<google.maps.Circle[]>([]);
+  const viewportCacheRef = useRef<
+    Record<
+      string,
+      {
+        viewport?: google.maps.LatLngBounds;
+        location: { lat: number; lng: number };
+        formattedAddress?: string;
+      }
+    >
+  >({});
+
+  // Look up official Google Maps Kecamatan viewport & boundary extent using Places API (New)
+  const focusKecamatanByGoogleMaps = useCallback(
+    async (kec: KecamatanGeo) => {
+      if (!map) return;
+
+      const cached = viewportCacheRef.current[kec.name];
+      if (cached) {
+        if (cached.viewport) {
+          map.fitBounds(cached.viewport, 40);
+        } else {
+          map.setCenter(cached.location);
+          map.setZoom(12);
+        }
+        onPlaceViewportResolved(kec.name, cached.location, cached.formattedAddress);
+        return;
+      }
+
+      if (placesLib && (placesLib as any).Place?.searchByText) {
+        try {
+          const { places } = await (placesLib as any).Place.searchByText({
+            textQuery: `Kecamatan ${kec.name}, Kabupaten Ogan Komering Ilir, Sumatera Selatan`,
+            fields: ['displayName', 'location', 'viewport', 'formattedAddress'],
+            language: 'id',
+            region: 'ID'
+          });
+
+          const place = places?.[0];
+          if (place) {
+            const loc = place.location
+              ? { lat: place.location.lat(), lng: place.location.lng() }
+              : { lat: kec.center[0], lng: kec.center[1] };
+
+            viewportCacheRef.current[kec.name] = {
+              viewport: place.viewport || undefined,
+              location: loc,
+              formattedAddress: place.formattedAddress || undefined
+            };
+
+            if (place.viewport) {
+              map.fitBounds(place.viewport, 40);
+            } else {
+              map.setCenter(loc);
+              map.setZoom(12);
+            }
+
+            onPlaceViewportResolved(kec.name, loc, place.formattedAddress || undefined);
+            return;
+          }
+        } catch (err: any) {
+          const msg = String(err?.message || err || '');
+          if (msg.includes('429') || msg.includes('RESOURCE_EXHAUSTED') || msg.includes('OVER_QUERY_LIMIT')) {
+            window.dispatchEvent(new CustomEvent('gmp-quota-exceeded'));
+          }
+        }
+      }
+
+      // Fallback to official center coordinate if Places lookup is unavailable
+      const fallbackPos = { lat: kec.center[0], lng: kec.center[1] };
+      map.setCenter(fallbackPos);
+      map.setZoom(12);
+      onPlaceViewportResolved(kec.name, fallbackPos);
+    },
+    [map, placesLib, onPlaceViewportResolved]
+  );
+
+  // Expose map camera controls to parent toolbar
+  useEffect(() => {
+    if (!map) return;
+    mapActionRef.current = {
+      zoomIn: () => {
+        const currentZoom = map.getZoom() ?? OKI_DEFAULT_ZOOM;
+        map.setZoom(currentZoom + 1);
+      },
+      zoomOut: () => {
+        const currentZoom = map.getZoom() ?? OKI_DEFAULT_ZOOM;
+        map.setZoom(currentZoom - 1);
+      },
+      resetCenter: () => {
+        map.setCenter({ lat: OKI_MAP_CENTER[0], lng: OKI_MAP_CENTER[1] });
+        map.setZoom(OKI_DEFAULT_ZOOM);
+      },
+      focusKecamatanByGoogleMaps
+    };
+  }, [map, mapActionRef, focusKecamatanByGoogleMaps]);
+
+  // Synchronize mapTypeId & administrative boundary feature layers when available
+  useEffect(() => {
+    if (!map) return;
+    map.setMapTypeId(googleType);
+
+    // Attempt to style Google Maps native administrative boundaries if enabled on the Map ID
+    try {
+      const featureTypeObj = (google.maps as any)?.FeatureType;
+      if (featureTypeObj && typeof map.getFeatureLayer === 'function') {
+        const adminLayer = map.getFeatureLayer(featureTypeObj.ADMINISTRATIVE_AREA_LEVEL_2);
+        if (adminLayer && adminLayer.isAvailable) {
+          adminLayer.style = {
+            strokeColor: '#047857',
+            strokeOpacity: 0.85,
+            strokeWeight: 2,
+            fillColor: '#10b981',
+            fillOpacity: 0.06
+          };
+        }
+      }
+    } catch {
+      // Ignore if vector FeatureLayer is not enabled on DEMO_MAP_ID
+    }
+  }, [map, googleType]);
+
+  // Render thermal density circles
+  useEffect(() => {
+    circlesRef.current.forEach(c => c.setMap(null));
+    circlesRef.current = [];
+
+    if (!map || !showHeatmap || heatmapPoints.length === 0 || typeof google === 'undefined' || !google.maps?.Circle) {
+      return;
+    }
+
+    const radiusMeters = heatmapRadius * 135;
+
+    heatmapPoints.forEach(pt => {
+      const normalized = Math.min(pt.weight / 3.5, 1);
+      const color =
+        normalized > 0.75
+          ? '#ef4444'
+          : normalized > 0.5
+          ? '#f97316'
+          : normalized > 0.3
+          ? '#facc15'
+          : '#10b981';
+
+      const circle = new google.maps.Circle({
+        center: { lat: pt.lat, lng: pt.lng },
+        radius: radiusMeters * (0.7 + normalized * 0.6),
+        strokeWeight: 0,
+        fillColor: color,
+        fillOpacity: 0.24 + normalized * 0.22,
+        clickable: false,
+        map
+      });
+
+      circlesRef.current.push(circle);
+    });
+
+    return () => {
+      circlesRef.current.forEach(c => c.setMap(null));
+      circlesRef.current = [];
+    };
+  }, [map, showHeatmap, heatmapPoints, heatmapRadius]);
+
+  return null;
+};
 
 export const OkiInteractiveMap: React.FC<OkiInteractiveMapProps> = ({
   records,
   onSelectKecamatan,
   selectedKecamatan
 }) => {
-  const [provider, setProvider] = useState<MapProvider>('osm');
   const [googleType, setGoogleType] = useState<GoogleMapType>('roadmap');
-  const [osmStyle, setOsmStyle] = useState<OsmTileStyle>('standard');
   const [activeKecamatan, setActiveKecamatan] = useState<KecamatanGeo | null>(null);
-  const [isGoogleLoading, setIsGoogleLoading] = useState(false);
-  const [_googleLoadError, setGoogleLoadError] = useState<string | null>(null);
+  const [infoWindowState, setInfoWindowState] = useState<{
+    kec: KecamatanGeo;
+    position: { lat: number; lng: number };
+    formattedAddress?: string;
+  } | null>(null);
 
-  // Heatmap State Controls
+  // Controls for Heatmap & Kecamatan Markers
   const [showHeatmap, setShowHeatmap] = useState<boolean>(true);
-  const [showPolygons, setShowPolygons] = useState<boolean>(true);
+  const [showMarkers, setShowMarkers] = useState<boolean>(true);
   const [heatmapRadius, setHeatmapRadius] = useState<number>(28);
   const [heatmapDataset, setHeatmapDataset] = useState<HeatmapDatasetFilter>('ALL');
   const [showHeatmapSettings, setShowHeatmapSettings] = useState<boolean>(false);
 
-  // Map container refs
-  const mapContainerRef = useRef<HTMLDivElement>(null);
-  const leafletMapRef = useRef<L.Map | null>(null);
-  const leafletLayersRef = useRef<{ [key: string]: L.Polygon }>({});
-  const leafletMarkersRef = useRef<L.Marker[]>([]);
-  const leafletHeatmapRef = useRef<any>(null);
-
-  const googleMapRef = useRef<any>(null);
-  const googlePolygonsRef = useRef<any[]>([]);
-  const googleMarkersRef = useRef<any[]>([]);
-  const googleInfoWindowRef = useRef<any>(null);
-  const googleHeatmapRef = useRef<any>(null);
+  const mapActionRef = useRef<{
+    zoomIn: () => void;
+    zoomOut: () => void;
+    resetCenter: () => void;
+    focusKecamatanByGoogleMaps: (kec: KecamatanGeo) => void;
+  } | null>(null);
 
   // Aggregate stats per kecamatan
   const statsByKecamatan = useMemo(() => {
@@ -178,41 +306,21 @@ export const OkiInteractiveMap: React.FC<OkiInteractiveMapProps> = ({
     return stats;
   }, [records]);
 
-  // Max value for color scaling
-  const maxTotal = useMemo(() => {
-    const vals = Object.values(statsByKecamatan).map(s => s.total);
-    return Math.max(...vals, 1);
-  }, [statsByKecamatan]);
-
-  // Color generator for Choropleth polygon fill
-  const getColor = (total: number, isSelected: boolean) => {
-    if (isSelected) return '#059669'; // Emerald dark when selected
-    const ratio = total / maxTotal;
-    if (ratio > 0.75) return '#047857'; // Deep emerald
-    if (ratio > 0.50) return '#059669'; // Emerald
-    if (ratio > 0.25) return '#10b981'; // Mint
-    if (ratio > 0.05) return '#34d399'; // Light green
-    return '#a7f3d0'; // Very pale green
-  };
-
-  // Generate Heatmap points based on real records data across OKI Kecamatan
+  // Generate density points based on real records data across OKI Kecamatan
   const heatmapPoints = useMemo<HeatPoint[]>(() => {
     const points: HeatPoint[] = [];
 
-    // Filter by selected source application if needed
     const targetRecords = records.filter(r => {
       if (heatmapDataset === 'ALL') return true;
       return r.sumber_aplikasi === heatmapDataset;
     });
 
-    // 1. Generate geospatial coordinates for each actual service record
     targetRecords.forEach((r, idx) => {
       const kecName = r.kecamatan?.trim();
       const geo =
         OKI_KECAMATAN_GEO.find(g => g.name.toLowerCase() === kecName?.toLowerCase()) ||
-        OKI_KECAMATAN_GEO[0]; // fallback to Kayu Agung
+        OKI_KECAMATAN_GEO[0];
 
-      // Stable deterministic pseudo-random offset within kecamatan geographic extent
       const str = `${r.id_dipta || ''}-${r.id_record_sumber || ''}-${idx}-${geo.name}`;
       let hash = 0;
       for (let i = 0; i < str.length; i++) {
@@ -222,7 +330,6 @@ export const OkiInteractiveMap: React.FC<OkiInteractiveMapProps> = ({
       const positiveHash = Math.abs(hash);
       const angle = (positiveHash % 360) * (Math.PI / 180);
 
-      // Radial dispersion based on kecamatan surface area
       const maxRadiusDeg = geo.areaKm2 > 3000 ? 0.065 : geo.areaKm2 > 1000 ? 0.042 : 0.022;
       const distRatio = Math.sqrt(((positiveHash >> 4) % 1000) / 1000);
       const radius = distRatio * maxRadiusDeg;
@@ -230,7 +337,6 @@ export const OkiInteractiveMap: React.FC<OkiInteractiveMapProps> = ({
       const lat = geo.center[0] + radius * Math.cos(angle);
       const lng = geo.center[1] + radius * Math.sin(angle);
 
-      // Weight based on transaction complexity
       let weight = 1.0;
       if (r.investasi_rupiah && r.investasi_rupiah > 100000000) {
         weight += 0.5;
@@ -248,7 +354,6 @@ export const OkiInteractiveMap: React.FC<OkiInteractiveMapProps> = ({
       });
     });
 
-    // 2. Add concentrated core cluster points at each kecamatan capital proportional to total volume
     OKI_KECAMATAN_GEO.forEach(geo => {
       const stats = statsByKecamatan[geo.name];
       if (stats && stats.total > 0) {
@@ -275,411 +380,24 @@ export const OkiInteractiveMap: React.FC<OkiInteractiveMapProps> = ({
     return points;
   }, [records, heatmapDataset, statsByKecamatan]);
 
-  // -------------------------------------------------------------
-  // OPENSTREETMAP (LEAFLET) IMPLEMENTATION
-  // -------------------------------------------------------------
-  useEffect(() => {
-    if (provider !== 'osm' || !mapContainerRef.current) return;
-
-    // Clean up any existing map
-    if (leafletMapRef.current) {
-      leafletMapRef.current.remove();
-      leafletMapRef.current = null;
-    }
-
-    const map = L.map(mapContainerRef.current, {
-      center: OKI_MAP_CENTER,
-      zoom: OKI_DEFAULT_ZOOM,
-      zoomControl: false
-    });
-
-    leafletMapRef.current = map;
-
-    // Tile URLs
-    let tileUrl = 'https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png';
-    let attribution = '&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a> contributors';
-
-    if (osmStyle === 'humanitarian') {
-      tileUrl = 'https://{s}.tile.openstreetmap.fr/hot/{z}/{x}/{y}.png';
-      attribution = '&copy; OpenStreetMap contributors, Tiles style by Humanitarian OpenStreetMap Team';
-    } else if (osmStyle === 'carto') {
-      tileUrl = 'https://{s}.basemaps.cartocdn.com/rastertiles/voyager/{z}/{x}/{y}{r}.png';
-      attribution = '&copy; OpenStreetMap contributors &copy; CARTO';
-    }
-
-    L.tileLayer(tileUrl, {
-      maxZoom: 18,
-      attribution
-    }).addTo(map);
-
-    leafletLayersRef.current = {};
-    leafletMarkersRef.current = [];
-    leafletHeatmapRef.current = null;
-
-    // 1. Draw Heatmap Layer on Leaflet if enabled
-    if (showHeatmap && heatmapPoints.length > 0) {
-      const heatFactory = (window as any).L?.heatLayer || (L as any).heatLayer;
-      if (typeof heatFactory === 'function') {
-        const lPoints = heatmapPoints.map(p => [p.lat, p.lng, p.weight]);
-        const heatLayer = heatFactory(lPoints, {
-          radius: heatmapRadius,
-          blur: Math.round(heatmapRadius * 0.65),
-          maxZoom: 14,
-          max: 2.2,
-          minOpacity: 0.25,
-          gradient: {
-            0.15: '#06b6d4',
-            0.35: '#10b981',
-            0.55: '#facc15',
-            0.75: '#f97316',
-            1.0: '#ef4444'
-          }
-        });
-        heatLayer.addTo(map);
-        leafletHeatmapRef.current = heatLayer;
-      }
-    }
-
-    // 2. Draw polygons for 18 kecamatan (opacity adjusts when heatmap is on)
-    if (showPolygons) {
-      OKI_KECAMATAN_GEO.forEach(kec => {
-        const stats = statsByKecamatan[kec.name] || { total: 0, oss: 0, sicantik: 0, simbg: 0 };
-        const isSelected = selectedKecamatan === kec.name;
-        const fillColor = getColor(stats.total, isSelected);
-
-        const polygon = L.polygon(kec.bounds, {
-          color: isSelected ? '#047857' : showHeatmap ? '#064e3b' : '#065f46',
-          weight: isSelected ? 3 : showHeatmap ? 1.2 : 1.5,
-          opacity: showHeatmap ? 0.65 : 0.9,
-          fillColor: fillColor,
-          fillOpacity: isSelected ? (showHeatmap ? 0.35 : 0.65) : showHeatmap ? 0.12 : 0.45,
-          dashArray: isSelected ? '' : '3'
-        }).addTo(map);
-
-        // Popup content
-        const popupContent = `
-          <div style="font-family: system-ui, sans-serif; min-width: 190px; padding: 2px;">
-            <div style="font-weight: 700; color: #0f172a; font-size: 13px;">Kec. ${kec.name}</div>
-            <div style="font-size: 11px; color: #64748b; margin-bottom: 6px;">Ibu kota: ${kec.capital}</div>
-            <div style="display: flex; justify-content: space-between; font-size: 11px; margin-bottom: 2px;">
-              <span>Total Pelayanan:</span>
-              <strong style="color: #047857;">${stats.total} berkas</strong>
-            </div>
-            <div style="display: flex; justify-content: space-between; font-size: 10px; color: #475569;">
-              <span>OSS-RBA: ${stats.oss}</span>
-              <span>SICANTIK: ${stats.sicantik}</span>
-              <span>SIMBG: ${stats.simbg}</span>
-            </div>
-            <div style="margin-top: 6px; padding-top: 4px; border-top: 1px solid #e2e8f0; font-size: 10px; color: #64748b;">
-              Luas: ${kec.areaKm2} km²
-            </div>
-          </div>
-        `;
-
-        polygon.bindPopup(popupContent);
-
-        polygon.on('mouseover', () => {
-          polygon.setStyle({
-            weight: 3,
-            fillOpacity: showHeatmap ? 0.4 : 0.75,
-            color: '#047857'
-          });
-          setActiveKecamatan(kec);
-        });
-
-        polygon.on('mouseout', () => {
-          polygon.setStyle({
-            weight: isSelected ? 3 : showHeatmap ? 1.2 : 1.5,
-            fillOpacity: isSelected ? (showHeatmap ? 0.35 : 0.65) : showHeatmap ? 0.12 : 0.45,
-            color: isSelected ? '#047857' : showHeatmap ? '#064e3b' : '#065f46'
-          });
-        });
-
-        polygon.on('click', () => {
-          setActiveKecamatan(kec);
-          if (onSelectKecamatan) {
-            onSelectKecamatan(kec.name);
-          }
-        });
-
-        leafletLayersRef.current[kec.name] = polygon;
-
-        // Label Marker at centroid
-        const customIcon = L.divIcon({
-          className: 'custom-map-label',
-          html: `
-            <div style="
-              background: rgba(255, 255, 255, 0.94);
-              border: 1px solid #cbd5e1;
-              border-radius: 6px;
-              padding: 2px 6px;
-              font-size: 10px;
-              font-weight: 600;
-              color: #1e293b;
-              box-shadow: 0 1px 3px rgba(0,0,0,0.12);
-              white-space: nowrap;
-              display: flex;
-              align-items: center;
-              gap: 4px;
-            ">
-              <span>${kec.name}</span>
-              <span style="
-                background: #059669;
-                color: #ffffff;
-                padding: 1px 4px;
-                border-radius: 4px;
-                font-size: 9px;
-                font-weight: 700;
-              ">${stats.total}</span>
-            </div>
-          `,
-          iconSize: [80, 20],
-          iconAnchor: [40, 10]
-        });
-
-        const marker = L.marker(kec.center, { icon: customIcon }).addTo(map);
-        marker.on('click', () => {
-          setActiveKecamatan(kec);
-          polygon.openPopup();
-          if (onSelectKecamatan) {
-            onSelectKecamatan(kec.name);
-          }
-        });
-
-        leafletMarkersRef.current.push(marker);
+  const handlePlaceViewportResolved = useCallback(
+    (kecName: string, centerPos: { lat: number; lng: number }, formattedAddress?: string) => {
+      const kec = OKI_KECAMATAN_GEO.find(k => k.name === kecName);
+      if (!kec) return;
+      setInfoWindowState({
+        kec,
+        position: centerPos,
+        formattedAddress
       });
-    }
+    },
+    []
+  );
 
-    setTimeout(() => {
-      map.invalidateSize();
-    }, 200);
-
-    return () => {
-      if (leafletMapRef.current) {
-        leafletMapRef.current.remove();
-        leafletMapRef.current = null;
-      }
-    };
-  }, [
-    provider,
-    osmStyle,
-    statsByKecamatan,
-    selectedKecamatan,
-    onSelectKecamatan,
-    showHeatmap,
-    showPolygons,
-    heatmapRadius,
-    heatmapPoints
-  ]);
-
-  // -------------------------------------------------------------
-  // GOOGLE MAPS IMPLEMENTATION
-  // -------------------------------------------------------------
-  useEffect(() => {
-    if (provider !== 'google' || !mapContainerRef.current) return;
-
-    let isMounted = true;
-    setIsGoogleLoading(true);
-    setGoogleLoadError(null);
-
-    loadGoogleMapsScript(GOOGLE_MAPS_KEY)
-      .then((google: any) => {
-        if (!isMounted || !mapContainerRef.current) return;
-
-        setIsGoogleLoading(false);
-
-        const gmap = new google.maps.Map(mapContainerRef.current, {
-          center: { lat: OKI_MAP_CENTER[0], lng: OKI_MAP_CENTER[1] },
-          zoom: OKI_DEFAULT_ZOOM,
-          mapTypeId: googleType,
-          disableDefaultUI: true,
-          zoomControl: false,
-          gestureHandling: 'cooperative'
-        });
-
-        googleMapRef.current = gmap;
-        googlePolygonsRef.current = [];
-        googleMarkersRef.current = [];
-        googleHeatmapRef.current = null;
-
-        const infoWindow = new google.maps.InfoWindow();
-        googleInfoWindowRef.current = infoWindow;
-
-        // 1. Google Maps Heatmap Layer
-        if (showHeatmap && heatmapPoints.length > 0 && google.maps.visualization?.HeatmapLayer) {
-          const gPoints = heatmapPoints.map(p => ({
-            location: new google.maps.LatLng(p.lat, p.lng),
-            weight: p.weight
-          }));
-
-          const heatmap = new google.maps.visualization.HeatmapLayer({
-            data: gPoints,
-            map: gmap,
-            radius: heatmapRadius,
-            opacity: 0.8,
-            gradient: [
-              'rgba(0, 255, 255, 0)',
-              'rgba(0, 255, 255, 1)',
-              'rgba(0, 191, 255, 1)',
-              'rgba(0, 255, 127, 1)',
-              'rgba(255, 255, 0, 1)',
-              'rgba(255, 140, 0, 1)',
-              'rgba(255, 69, 0, 1)',
-              'rgba(255, 0, 0, 1)'
-            ]
-          });
-          googleHeatmapRef.current = heatmap;
-        }
-
-        // 2. Render 18 Kecamatan Polygons on Google Maps
-        if (showPolygons) {
-          OKI_KECAMATAN_GEO.forEach(kec => {
-            const stats = statsByKecamatan[kec.name] || { total: 0, oss: 0, sicantik: 0, simbg: 0 };
-            const isSelected = selectedKecamatan === kec.name;
-            const fillColor = getColor(stats.total, isSelected);
-
-            const paths = kec.bounds.map(coord => ({
-              lat: coord[0],
-              lng: coord[1]
-            }));
-
-            const polygon = new google.maps.Polygon({
-              paths,
-              strokeColor: isSelected ? '#047857' : showHeatmap ? '#064e3b' : '#065f46',
-              strokeOpacity: showHeatmap ? 0.7 : 0.9,
-              strokeWeight: isSelected ? 3 : showHeatmap ? 1.2 : 1.5,
-              fillColor: fillColor,
-              fillOpacity: isSelected ? (showHeatmap ? 0.35 : 0.65) : showHeatmap ? 0.12 : 0.45,
-              map: gmap
-            });
-
-            googlePolygonsRef.current.push(polygon);
-
-            polygon.addListener('mouseover', () => {
-              polygon.setOptions({
-                strokeWeight: 3,
-                fillOpacity: showHeatmap ? 0.4 : 0.75,
-                strokeColor: '#047857'
-              });
-              setActiveKecamatan(kec);
-            });
-
-            polygon.addListener('mouseout', () => {
-              polygon.setOptions({
-                strokeWeight: isSelected ? 3 : showHeatmap ? 1.2 : 1.5,
-                fillOpacity: isSelected ? (showHeatmap ? 0.35 : 0.65) : showHeatmap ? 0.12 : 0.45,
-                strokeColor: isSelected ? '#047857' : showHeatmap ? '#064e3b' : '#065f46'
-              });
-            });
-
-            polygon.addListener('click', (e: any) => {
-              setActiveKecamatan(kec);
-              if (onSelectKecamatan) {
-                onSelectKecamatan(kec.name);
-              }
-
-              const content = `
-                <div style="font-family: system-ui, sans-serif; min-width: 190px; padding: 4px;">
-                  <div style="font-weight: 700; color: #0f172a; font-size: 13px;">Kecamatan ${kec.name}</div>
-                  <div style="font-size: 11px; color: #64748b; margin-bottom: 6px;">Ibu kota: ${kec.capital}</div>
-                  <div style="display: flex; justify-content: space-between; font-size: 11px; margin-bottom: 2px;">
-                    <span>Total Pelayanan:</span>
-                    <strong style="color: #047857;">${stats.total} berkas</strong>
-                  </div>
-                  <div style="display: flex; justify-content: space-between; font-size: 10px; color: #475569;">
-                    <span>OSS: ${stats.oss}</span>
-                    <span>SICANTIK: ${stats.sicantik}</span>
-                    <span>SIMBG: ${stats.simbg}</span>
-                  </div>
-                  <div style="margin-top: 6px; padding-top: 4px; border-top: 1px solid #e2e8f0; font-size: 10px; color: #64748b;">
-                    Luas Wilayah: ${kec.areaKm2} km²
-                  </div>
-                </div>
-              `;
-
-              infoWindow.setContent(content);
-              infoWindow.setPosition(e.latLng || { lat: kec.center[0], lng: kec.center[1] });
-              infoWindow.open(gmap);
-            });
-
-            // Label Marker
-            const marker = new google.maps.Marker({
-              position: { lat: kec.center[0], lng: kec.center[1] },
-              map: gmap,
-              title: `${kec.name} (${stats.total} berkas)`,
-              label: {
-                text: `${kec.name}`,
-                color: '#0f172a',
-                fontSize: '10px',
-                fontWeight: 'bold',
-                className: 'google-maps-kec-label'
-              },
-              icon: {
-                path: google.maps.SymbolPath.CIRCLE,
-                scale: 6,
-                fillColor: '#059669',
-                fillOpacity: 1,
-                strokeColor: '#ffffff',
-                strokeWeight: 2
-              }
-            });
-
-            marker.addListener('click', () => {
-              setActiveKecamatan(kec);
-              if (onSelectKecamatan) {
-                onSelectKecamatan(kec.name);
-              }
-            });
-
-            googleMarkersRef.current.push(marker);
-          });
-        }
-      })
-      .catch((_err: any) => {
-        if (!isMounted) return;
-        setIsGoogleLoading(false);
-        setGoogleLoadError('Gagal memuat Google Maps SDK. Beralih ke OpenStreetMap.');
-        setProvider('osm');
-      });
-
-    return () => {
-      isMounted = false;
-    };
-  }, [
-    provider,
-    googleType,
-    statsByKecamatan,
-    selectedKecamatan,
-    onSelectKecamatan,
-    showHeatmap,
-    showPolygons,
-    heatmapRadius,
-    heatmapPoints
-  ]);
-
-  // Zoom handlers
-  const handleZoomIn = () => {
-    if (provider === 'osm' && leafletMapRef.current) {
-      leafletMapRef.current.zoomIn();
-    } else if (provider === 'google' && googleMapRef.current) {
-      googleMapRef.current.setZoom((googleMapRef.current.getZoom() || OKI_DEFAULT_ZOOM) + 1);
-    }
-  };
-
-  const handleZoomOut = () => {
-    if (provider === 'osm' && leafletMapRef.current) {
-      leafletMapRef.current.zoomOut();
-    } else if (provider === 'google' && googleMapRef.current) {
-      googleMapRef.current.setZoom((googleMapRef.current.getZoom() || OKI_DEFAULT_ZOOM) - 1);
-    }
-  };
-
-  const handleResetCenter = () => {
-    if (provider === 'osm' && leafletMapRef.current) {
-      leafletMapRef.current.setView(OKI_MAP_CENTER, OKI_DEFAULT_ZOOM);
-    } else if (provider === 'google' && googleMapRef.current) {
-      googleMapRef.current.setCenter({ lat: OKI_MAP_CENTER[0], lng: OKI_MAP_CENTER[1] });
-      googleMapRef.current.setZoom(OKI_DEFAULT_ZOOM);
+  const handleKecamatanSelect = (kec: KecamatanGeo) => {
+    setActiveKecamatan(kec);
+    mapActionRef.current?.focusKecamatanByGoogleMaps(kec);
+    if (onSelectKecamatan) {
+      onSelectKecamatan(kec.name);
     }
   };
 
@@ -697,86 +415,56 @@ export const OkiInteractiveMap: React.FC<OkiInteractiveMapProps> = ({
           </div>
           <div>
             <h4 className="text-xs font-bold text-slate-900">
-              Peta Geospasial Kabupaten Ogan Komering Ilir
+              Peta Geospasial Google Maps — Kabupaten Ogan Komering Ilir
             </h4>
             <p className="text-[11px] text-slate-500">
-              Visualisasi batas 18 kecamatan & layer Heatmap kerapatan permohonan layanan
+              Menggunakan batas wilayah kecamatan resmi dari Google Maps Platform & layer kerapatan permohonan layanan
             </p>
           </div>
         </div>
 
-        {/* Engine Switcher & Provider */}
+        {/* Google Maps Layer Switcher */}
         <div className="flex items-center gap-2 flex-wrap">
-          {/* Provider Toggle: Google Maps vs OSM */}
-          <div className="flex items-center bg-white border border-slate-300 rounded-lg p-0.5 text-[11px]">
-            <button
-              id="btn-map-osm"
-              onClick={() => setProvider('osm')}
-              className={`px-3 py-1 rounded-md font-semibold transition-all ${
-                provider === 'osm'
-                  ? 'bg-emerald-600 text-white shadow-xs'
-                  : 'text-slate-600 hover:text-slate-900'
-              }`}
-            >
-              OpenStreetMap (OSM)
-            </button>
-            <button
-              id="btn-map-google"
-              onClick={() => setProvider('google')}
-              className={`px-3 py-1 rounded-md font-semibold transition-all ${
-                provider === 'google'
-                  ? 'bg-emerald-600 text-white shadow-xs'
-                  : 'text-slate-600 hover:text-slate-900'
-              }`}
-            >
-              Google Maps
-            </button>
-          </div>
-
-          {/* Sub-layers for OSM */}
-          {provider === 'osm' && (
-            <select
-              value={osmStyle}
-              onChange={e => setOsmStyle(e.target.value as OsmTileStyle)}
-              className="bg-white border border-slate-300 text-slate-700 text-[11px] font-medium rounded-lg px-2.5 py-1.5 focus:outline-none"
-            >
-              <option value="standard">OSM Standar</option>
-              <option value="humanitarian">OSM Humanitarian</option>
-              <option value="carto">CartoDB Positron</option>
-            </select>
-          )}
+          <span className="px-2.5 py-1 rounded-md bg-emerald-600 text-white text-[11px] font-semibold shadow-xs">
+            Google Maps Platform
+          </span>
 
           {/* Sub-layers for Google Maps */}
-          {provider === 'google' && (
-            <select
-              value={googleType}
-              onChange={e => setGoogleType(e.target.value as GoogleMapType)}
-              className="bg-white border border-slate-300 text-slate-700 text-[11px] font-medium rounded-lg px-2.5 py-1.5 focus:outline-none"
-            >
-              <option value="roadmap">Google Roadmap (Jalan)</option>
-              <option value="satellite">Citra Satelit</option>
-              <option value="hybrid">Hibrida (Satelit + Label)</option>
-              <option value="terrain">Terrain (Relief Kontur)</option>
-            </select>
-          )}
+          <select
+            value={googleType}
+            onChange={e => setGoogleType(e.target.value as GoogleMapType)}
+            className="bg-white border border-slate-300 text-slate-700 text-[11px] font-medium rounded-lg px-2.5 py-1.5 focus:outline-none"
+          >
+            <option value="roadmap">Google Roadmap (Batas Administrasi)</option>
+            <option value="terrain">Terrain (Batas Wilayah & Kontur)</option>
+            <option value="hybrid">Hibrida (Satelit + Batas Wilayah)</option>
+            <option value="satellite">Citra Satelit Murni</option>
+          </select>
 
           {/* Google Maps External Place Link */}
           <a
-            href="https://www.google.com/maps/place/Kabupaten+Ogan+Komering+Ilir,+Sumatera+Selatan/@-3.3068054,104.9174473,9.11z/data=!4m6!3m5!1s0x2e3c0d6d1a62ce07:0x3039d80b220d0e0!8m2!3d-3.4559744!4d105.2194808!16s%2Fm%2F0gg6c6n?entry=ttu"
+            href={
+              activeKecamatan
+                ? `https://www.google.com/maps/search/?api=1&query=${encodeURIComponent(
+                    `Kecamatan ${activeKecamatan.name}, Kabupaten Ogan Komering Ilir, Sumatera Selatan`
+                  )}`
+                : 'https://www.google.com/maps/place/Kabupaten+Ogan+Komering+Ilir,+Sumatera+Selatan/@-3.3068054,104.9174473,9.11z/data=!4m6!3m5!1s0x2e3c0d6d1a62ce07:0x3039d80b220d0e0!8m2!3d-3.4559744!4d105.2194808!16s%2Fm%2F0gg6c6n?entry=ttu'
+            }
             target="_blank"
             rel="noopener noreferrer"
-            title="Buka Peta Kabupaten OKI di Google Maps Resmi"
+            title="Lihat Batas Wilayah Resmi di Google Maps"
             className="flex items-center gap-1 bg-white hover:bg-slate-100 text-slate-700 border border-slate-300 px-2.5 py-1.5 rounded-lg text-[11px] font-medium transition-colors"
           >
             <ExternalLink className="w-3 h-3 text-slate-500" />
-            <span className="hidden md:inline">Buka di Google Maps</span>
+            <span className="hidden md:inline">
+              {activeKecamatan ? `Batas Kec. ${activeKecamatan.name}` : 'Buka di Google Maps'}
+            </span>
           </a>
         </div>
       </div>
 
-      {/* HEATMAP INTERACTIVE TOOLBAR & CONTROLS */}
+      {/* HEATMAP & MARKER INTERACTIVE TOOLBAR */}
       <div className="bg-white border border-slate-200 rounded-xl p-3 shadow-xs flex flex-col md:flex-row md:items-center justify-between gap-3 text-xs">
-        {/* Heatmap Toggle & Status */}
         <div className="flex items-center gap-2.5 flex-wrap">
           <button
             onClick={() => setShowHeatmap(!showHeatmap)}
@@ -787,23 +475,21 @@ export const OkiInteractiveMap: React.FC<OkiInteractiveMapProps> = ({
             }`}
           >
             <Flame className={`w-4 h-4 ${showHeatmap ? 'text-yellow-200 animate-pulse' : 'text-slate-500'}`} />
-            <span>Heatmap Kerapatan {showHeatmap ? 'Aktif' : 'Non-Aktif'}</span>
+            <span>Zona Kerapatan {showHeatmap ? 'Aktif' : 'Non-Aktif'}</span>
           </button>
 
-          {/* Polygon Boundary Toggle */}
           <button
-            onClick={() => setShowPolygons(!showPolygons)}
+            onClick={() => setShowMarkers(!showMarkers)}
             className={`flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs font-medium transition-all ${
-              showPolygons
+              showMarkers
                 ? 'bg-emerald-50 text-emerald-800 border border-emerald-300 font-semibold'
                 : 'bg-slate-100 text-slate-600 border border-slate-300'
             }`}
           >
-            {showPolygons ? <Eye className="w-3.5 h-3.5 text-emerald-600" /> : <EyeOff className="w-3.5 h-3.5 text-slate-400" />}
-            <span>Batas Wilayah Kecamatan</span>
+            {showMarkers ? <Eye className="w-3.5 h-3.5 text-emerald-600" /> : <EyeOff className="w-3.5 h-3.5 text-slate-400" />}
+            <span>Penanda 18 Kecamatan</span>
           </button>
 
-          {/* Heatmap Density Points Counter */}
           <div className="flex items-center gap-1.5 bg-slate-50 px-2.5 py-1.5 rounded-lg border border-slate-200 text-[11px] text-slate-600">
             <span className="w-2 h-2 rounded-full bg-rose-500 animate-ping"></span>
             <span>
@@ -812,9 +498,7 @@ export const OkiInteractiveMap: React.FC<OkiInteractiveMapProps> = ({
           </div>
         </div>
 
-        {/* Heatmap Dataset & Radius Filter */}
         <div className="flex items-center gap-2 flex-wrap">
-          {/* Source Application Filter for Heatmap */}
           <div className="flex items-center gap-1">
             <Filter className="w-3.5 h-3.5 text-slate-500" />
             <select
@@ -829,7 +513,6 @@ export const OkiInteractiveMap: React.FC<OkiInteractiveMapProps> = ({
             </select>
           </div>
 
-          {/* Heatmap Radius Tuning Button */}
           <button
             onClick={() => setShowHeatmapSettings(!showHeatmapSettings)}
             className={`flex items-center gap-1 px-2.5 py-1 rounded-lg border text-xs font-medium transition-colors ${
@@ -850,7 +533,7 @@ export const OkiInteractiveMap: React.FC<OkiInteractiveMapProps> = ({
           <div className="flex items-center gap-2">
             <Flame className="w-4 h-4 text-amber-600" />
             <span className="font-semibold text-amber-900">
-              Pengaturan Radius Sebaran Termal Heatmap:
+              Pengaturan Radius Sebaran Termal:
             </span>
           </div>
           <div className="flex items-center gap-3">
@@ -872,32 +555,124 @@ export const OkiInteractiveMap: React.FC<OkiInteractiveMapProps> = ({
         </div>
       )}
 
-      {/* Map Display & Canvas */}
-      <div className="relative w-full h-[450px] rounded-xl overflow-hidden border border-slate-300 shadow-inner bg-slate-100">
-        {/* Loading Indicator for Google Maps */}
-        {isGoogleLoading && (
-          <div className="absolute inset-0 bg-white/70 backdrop-blur-xs flex items-center justify-center z-30">
-            <div className="flex items-center gap-2 text-xs font-semibold text-emerald-800 bg-white px-4 py-2.5 rounded-lg shadow-md border border-slate-200">
-              <span className="w-3.5 h-3.5 border-2 border-emerald-600 border-t-transparent rounded-full animate-spin"></span>
-              Memuat Peta Google Maps Kabupaten OKI...
-            </div>
-          </div>
-        )}
+      {/* Map Display & Canvas (Explicit height required per CF2) */}
+      <div className="relative w-full h-[460px] rounded-xl overflow-hidden border border-slate-300 shadow-inner bg-slate-100">
+        <APIProvider apiKey={GOOGLE_MAPS_API_KEY} libraries={['marker', 'places']} language="id" region="ID">
+          <Map
+            mapId="DEMO_MAP_ID"
+            defaultCenter={{ lat: OKI_MAP_CENTER[0], lng: OKI_MAP_CENTER[1] }}
+            defaultZoom={OKI_DEFAULT_ZOOM}
+            mapTypeId={googleType}
+            gestureHandling="cooperative"
+            disableDefaultUI={true}
+            internalUsageAttributionIds={['gmp_mcp_codeassist_v1_aistudio']}
+            className="w-full h-full"
+          >
+            <OkiMapOverlays
+              googleType={googleType}
+              showHeatmap={showHeatmap}
+              heatmapRadius={heatmapRadius}
+              heatmapPoints={heatmapPoints}
+              onPlaceViewportResolved={handlePlaceViewportResolved}
+              mapActionRef={mapActionRef}
+            />
 
-        {/* Map Container */}
-        <div ref={mapContainerRef} className="w-full h-full" />
+            {/* Modern AdvancedMarker for each of the 18 Kecamatan */}
+            {showMarkers &&
+              OKI_KECAMATAN_GEO.map(kec => {
+                const stats = statsByKecamatan[kec.name] || {
+                  total: 0,
+                  oss: 0,
+                  sicantik: 0,
+                  simbg: 0
+                };
+                const isSelected = selectedKecamatan === kec.name || activeKecamatan?.name === kec.name;
+
+                return (
+                  <AdvancedMarker
+                    key={kec.id}
+                    position={{ lat: kec.center[0], lng: kec.center[1] }}
+                    title={`Kecamatan ${kec.name} (${stats.total} berkas) — Klik untuk fokus ke batas wilayah Google Maps`}
+                    onClick={() => handleKecamatanSelect(kec)}
+                  >
+                    <div
+                      className={`flex items-center gap-1 px-2 py-0.5 rounded-md border text-[10px] font-semibold shadow-sm whitespace-nowrap transition-transform cursor-pointer ${
+                        isSelected
+                          ? 'bg-emerald-700 text-white border-emerald-900 scale-110 ring-2 ring-emerald-300'
+                          : 'bg-white/95 text-slate-800 border-slate-300 hover:scale-105'
+                      }`}
+                    >
+                      <MapPin className={`w-2.5 h-2.5 ${isSelected ? 'text-emerald-200' : 'text-emerald-600'}`} />
+                      <span>{kec.name}</span>
+                      <span
+                        className={`px-1 py-0.2 rounded text-[9px] font-bold ${
+                          isSelected
+                            ? 'bg-white text-emerald-800'
+                            : 'bg-emerald-600 text-white'
+                        }`}
+                      >
+                        {stats.total}
+                      </span>
+                    </div>
+                  </AdvancedMarker>
+                );
+              })}
+
+            {/* InfoWindow when a Kecamatan is clicked */}
+            {infoWindowState && (
+              <InfoWindow
+                position={infoWindowState.position}
+                onCloseClick={() => setInfoWindowState(null)}
+              >
+                <div className="min-w-[205px] p-1 text-slate-800">
+                  <div className="font-bold text-slate-900 text-xs">
+                    Kecamatan {infoWindowState.kec.name}
+                  </div>
+                  <div className="text-[10px] text-slate-500 mb-1.5">
+                    {infoWindowState.formattedAddress || `Ibu kota: ${infoWindowState.kec.capital}, Kab. OKI`}
+                  </div>
+                  <div className="flex justify-between text-[11px] mb-1">
+                    <span>Total Pelayanan:</span>
+                    <strong className="text-emerald-700">
+                      {statsByKecamatan[infoWindowState.kec.name]?.total || 0} berkas
+                    </strong>
+                  </div>
+                  <div className="flex justify-between text-[10px] text-slate-600 gap-2">
+                    <span>OSS: {statsByKecamatan[infoWindowState.kec.name]?.oss || 0}</span>
+                    <span>SICANTIK: {statsByKecamatan[infoWindowState.kec.name]?.sicantik || 0}</span>
+                    <span>SIMBG: {statsByKecamatan[infoWindowState.kec.name]?.simbg || 0}</span>
+                  </div>
+                  <div className="mt-1.5 pt-1 border-t border-slate-200 flex items-center justify-between text-[10px] text-slate-500">
+                    <span>Luas: {infoWindowState.kec.areaKm2} km²</span>
+                    <a
+                      href={`https://www.google.com/maps/search/?api=1&query=${encodeURIComponent(
+                        `Kecamatan ${infoWindowState.kec.name}, Kabupaten Ogan Komering Ilir, Sumatera Selatan`
+                      )}`}
+                      target="_blank"
+                      rel="noopener noreferrer"
+                      className="text-emerald-700 hover:underline font-semibold flex items-center gap-0.5"
+                    >
+                      <span>Batas Google Maps</span>
+                      <ExternalLink className="w-2.5 h-2.5" />
+                    </a>
+                  </div>
+                </div>
+              </InfoWindow>
+            )}
+          </Map>
+        </APIProvider>
 
         {/* Custom Zoom & Reset Controls */}
         <div className="absolute top-3 right-3 z-20 flex flex-col gap-1.5 bg-white rounded-lg shadow-md border border-slate-200 p-1">
           <button
-            onClick={handleZoomIn}
+            onClick={() => mapActionRef.current?.zoomIn()}
             title="Perbesar Peta"
             className="p-1.5 hover:bg-slate-100 text-slate-700 rounded transition-colors"
           >
             <ZoomIn className="w-4 h-4" />
           </button>
           <button
-            onClick={handleZoomOut}
+            onClick={() => mapActionRef.current?.zoomOut()}
             title="Perkecil Peta"
             className="p-1.5 hover:bg-slate-100 text-slate-700 rounded transition-colors"
           >
@@ -905,7 +680,14 @@ export const OkiInteractiveMap: React.FC<OkiInteractiveMapProps> = ({
           </button>
           <div className="h-[1px] bg-slate-200 my-0.5" />
           <button
-            onClick={handleResetCenter}
+            onClick={() => {
+              setActiveKecamatan(null);
+              setInfoWindowState(null);
+              mapActionRef.current?.resetCenter();
+              if (onSelectKecamatan) {
+                onSelectKecamatan('SEMUA');
+              }
+            }}
             title="Pusatkan ke Kabupaten OKI"
             className="p-1.5 hover:bg-slate-100 text-emerald-700 rounded transition-colors"
           >
@@ -915,7 +697,7 @@ export const OkiInteractiveMap: React.FC<OkiInteractiveMapProps> = ({
 
         {/* Legend Overlay at Bottom-Left */}
         <div className="absolute bottom-3 left-3 z-20 bg-white/95 backdrop-blur-xs p-3 rounded-xl shadow-lg border border-slate-200 text-[10px] text-slate-700 space-y-2 max-w-[240px]">
-          {showHeatmap ? (
+          {showHeatmap && (
             <div>
               <div className="font-bold text-slate-900 flex items-center justify-between mb-1.5">
                 <span className="flex items-center gap-1 text-rose-700 font-bold">
@@ -923,54 +705,24 @@ export const OkiInteractiveMap: React.FC<OkiInteractiveMapProps> = ({
                   Kerapatan Pelayanan
                 </span>
                 <span className="text-[9px] bg-rose-100 text-rose-800 px-1.5 py-0.2 rounded font-semibold">
-                  Heatmap
+                  Density
                 </span>
               </div>
-              {/* Heatmap Gradient Bar */}
-              <div className="h-3 w-full rounded-md bg-gradient-to-r from-cyan-400 via-emerald-400 via-yellow-400 via-orange-500 to-rose-600 shadow-xs border border-slate-300 mb-1"></div>
+              <div className="h-3 w-full rounded-md bg-gradient-to-r from-emerald-400 via-yellow-400 via-orange-500 to-rose-600 shadow-xs border border-slate-300 mb-1"></div>
               <div className="flex justify-between text-[9px] text-slate-600 font-medium">
                 <span>Rendah</span>
                 <span>Sedang</span>
                 <span>Padat / Tinggi</span>
               </div>
-              <div className="pt-1.5 border-t border-slate-200 text-[9px] text-slate-500 leading-tight">
-                Konsentrasi tertinggi di <strong className="text-slate-800">Kayu Agung</strong>,{' '}
-                <strong className="text-slate-800">Lempuing</strong>, &{' '}
-                <strong className="text-slate-800">Teluk Gelam</strong>.
-              </div>
-            </div>
-          ) : (
-            <div>
-              <div className="font-bold text-slate-900 flex items-center justify-between mb-1.5">
-                <span>Intensitas Pelayanan</span>
-                <span className="text-[9px] text-slate-400 font-normal">Choropleth</span>
-              </div>
-              <div className="space-y-1">
-                <div className="flex items-center gap-1.5">
-                  <span className="w-3.5 h-3.5 rounded bg-[#a7f3d0] border border-slate-300"></span>
-                  <span>Rendah (&lt; 5 berkas)</span>
-                </div>
-                <div className="flex items-center gap-1.5">
-                  <span className="w-3.5 h-3.5 rounded bg-[#34d399] border border-slate-300"></span>
-                  <span>Sedang (5 - 15 berkas)</span>
-                </div>
-                <div className="flex items-center gap-1.5">
-                  <span className="w-3.5 h-3.5 rounded bg-[#059669] border border-slate-300"></span>
-                  <span>Tinggi (&gt; 15 berkas)</span>
-                </div>
-              </div>
             </div>
           )}
 
-          {showPolygons && (
-            <div className="pt-1 border-t border-slate-200 text-[9px] text-slate-500 flex items-center gap-1">
-              <span className="w-3 h-0.5 bg-emerald-700 border border-dashed border-emerald-900"></span>
-              <span>Garis putus-putus: Batas 18 Kecamatan</span>
-            </div>
-          )}
+          <div className="pt-1 border-t border-slate-200 text-[9px] text-slate-600 leading-tight">
+            Batas wilayah menggunakan peta administrasi resmi <strong>Google Maps</strong>. Klik salah satu kecamatan untuk menyesuaikan cakupan wilayah (<em>viewport</em>).
+          </div>
         </div>
 
-        {/* Active Kecamatan Quick Card (Hover/Click Detail) at Bottom-Right */}
+        {/* Active Kecamatan Quick Card (Click Detail) at Bottom-Right */}
         {activeKecamatan && activeStats && (
           <div className="absolute bottom-3 right-3 z-20 bg-white/95 backdrop-blur-xs p-3.5 rounded-xl shadow-lg border border-slate-200 text-xs text-slate-800 max-w-xs animate-in fade-in slide-in-from-bottom-2">
             <div className="flex items-center justify-between pb-1.5 border-b border-slate-100 mb-2">
@@ -1027,7 +779,7 @@ export const OkiInteractiveMap: React.FC<OkiInteractiveMapProps> = ({
       <div className="bg-white border border-slate-200 rounded-xl p-3.5 shadow-xs">
         <div className="flex items-center justify-between mb-2">
           <span className="text-xs font-bold text-slate-800">
-            Daftar 18 Kecamatan Kabupaten Ogan Komering Ilir (Klik untuk sorot peta)
+            Daftar 18 Kecamatan Kabupaten Ogan Komering Ilir (Klik untuk fokus ke batas wilayah Google Maps)
           </span>
           <span className="text-[11px] text-slate-500">
             Terpusat di Kayu Agung (-3.4559744, 105.2194808)
@@ -1037,24 +789,11 @@ export const OkiInteractiveMap: React.FC<OkiInteractiveMapProps> = ({
         <div className="grid grid-cols-2 sm:grid-cols-3 md:grid-cols-6 gap-1.5 text-xs">
           {OKI_KECAMATAN_GEO.map(k => {
             const stats = statsByKecamatan[k.name] || { total: 0 };
-            const isSelected = selectedKecamatan === k.name;
+            const isSelected = selectedKecamatan === k.name || activeKecamatan?.name === k.name;
             return (
               <button
                 key={k.id}
-                onClick={() => {
-                  setActiveKecamatan(k);
-                  if (provider === 'osm' && leafletMapRef.current) {
-                    leafletMapRef.current.setView(k.center, 11);
-                    const poly = leafletLayersRef.current[k.name];
-                    if (poly) poly.openPopup();
-                  } else if (provider === 'google' && googleMapRef.current) {
-                    googleMapRef.current.setCenter({ lat: k.center[0], lng: k.center[1] });
-                    googleMapRef.current.setZoom(11);
-                  }
-                  if (onSelectKecamatan) {
-                    onSelectKecamatan(k.name);
-                  }
-                }}
+                onClick={() => handleKecamatanSelect(k)}
                 className={`p-1.5 rounded-lg border text-left transition-all flex items-center justify-between ${
                   isSelected
                     ? 'border-emerald-600 bg-emerald-50 text-emerald-900 font-bold'

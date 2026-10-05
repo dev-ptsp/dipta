@@ -2,7 +2,7 @@
 import React from 'react';
 import { User } from '../types';
 import { DiptaStorageService } from '../services/dataStorage';
-import { Shield, AlertTriangle, RefreshCw, UserCheck, ChevronDown, Trash2 } from 'lucide-react';
+import { Shield, AlertTriangle, RefreshCw, UserCheck, ChevronDown, Trash2, LogOut } from 'lucide-react';
 
 interface HeaderProps {
   currentUser: User;
@@ -11,6 +11,7 @@ interface HeaderProps {
   onNavigateToQuality: () => void;
   onResetData: () => void;
   onOpenDatabase?: () => void;
+  onLogout?: () => void;
 }
 
 export const Header: React.FC<HeaderProps> = ({
@@ -19,6 +20,7 @@ export const Header: React.FC<HeaderProps> = ({
   openIssuesCount,
   onNavigateToQuality,
   onResetData,
+  onLogout,
 }) => {
   const allUsers = DiptaStorageService.getAllUsers();
   const [showUserDropdown, setShowUserDropdown] = React.useState(false);
@@ -32,8 +34,18 @@ export const Header: React.FC<HeaderProps> = ({
         <div className="flex items-center justify-between h-16">
           {/* Logo & Identity */}
           <div className="flex items-center gap-3">
-            <div className="w-10 h-10 rounded-xl bg-gradient-to-br from-emerald-600 to-teal-800 flex items-center justify-center text-white font-bold text-lg shadow-xs ring-2 ring-emerald-100">
-              D
+            <div className="w-10 h-10 rounded-xl bg-white border border-slate-200 overflow-hidden flex items-center justify-center shadow-xs p-0.5">
+              <img
+                src="/logo-dipta.jpg"
+                alt="Logo DIPTA DPMPTSP OKI"
+                className="w-full h-full object-contain"
+                onError={(e) => {
+                  const target = e.target as HTMLImageElement;
+                  if (!target.src.includes('logo-dipta.png')) {
+                    target.src = '/logo-dipta.png';
+                  }
+                }}
+              />
             </div>
             <div>
               <div className="flex items-center gap-2">
@@ -51,7 +63,7 @@ export const Header: React.FC<HeaderProps> = ({
           </div>
 
           {/* Center/Right Info & User Controls */}
-          <div className="flex items-center gap-3">
+          <div className="flex items-center gap-2 sm:gap-3">
             {/* Open Data Quality Alert Badge */}
             {openIssuesCount > 0 && (
               <button
@@ -85,7 +97,7 @@ export const Header: React.FC<HeaderProps> = ({
                 onClick={() => setShowUserDropdown(!showUserDropdown)}
                 className="flex items-center gap-2 px-2.5 py-1.5 rounded-xl border border-slate-200 hover:border-slate-300 bg-white hover:bg-slate-50 transition-all text-left"
               >
-                <div className="w-7 h-7 rounded-lg bg-slate-100 border border-slate-200 flex items-center justify-center text-slate-700 font-semibold text-xs">
+                <div className="w-7 h-7 rounded-lg bg-indigo-50 border border-indigo-200 flex items-center justify-center text-indigo-700 font-semibold text-xs">
                   {currentUser.full_name.charAt(0)}
                 </div>
                 <div className="hidden md:block">
@@ -149,12 +161,36 @@ export const Header: React.FC<HeaderProps> = ({
                     })}
                   </div>
 
-                  <div className="pt-2 mt-1 border-t border-slate-100 px-2 text-[10px] text-slate-400">
-                    Kewenangan dibatasi otomatis berdasarkan Role.
-                  </div>
+                  {onLogout && (
+                    <div className="pt-2 mt-1 border-t border-slate-100">
+                      <button
+                        id="header-btn-logout"
+                        onClick={() => {
+                          setShowUserDropdown(false);
+                          onLogout();
+                        }}
+                        className="w-full text-left px-3 py-2 rounded-lg text-rose-700 hover:bg-rose-50 font-semibold text-xs flex items-center gap-2 transition-colors cursor-pointer"
+                      >
+                        <LogOut className="w-3.5 h-3.5" />
+                        <span>Keluar dari Sistem (Logout)</span>
+                      </button>
+                    </div>
+                  )}
                 </div>
               )}
             </div>
+
+            {/* Quick Header Logout Button */}
+            {onLogout && (
+              <button
+                id="header-quick-logout"
+                onClick={onLogout}
+                title="Keluar dari Sistem (Logout)"
+                className="p-2 text-slate-400 hover:text-rose-600 hover:bg-rose-50 rounded-lg transition-colors cursor-pointer"
+              >
+                <LogOut className="w-4 h-4" />
+              </button>
+            )}
           </div>
         </div>
       </div>
